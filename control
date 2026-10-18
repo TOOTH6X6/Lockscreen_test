@@ -1,0 +1,9 @@
+Package: com.user.clockfont
+Name: ClockFont
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Lock screen clock in Apple's tall ADT numeric font
+Maintainer: you <you@example.com>
+Author: you
+Section: Tweaks
+Depends: mobilesubstrate
