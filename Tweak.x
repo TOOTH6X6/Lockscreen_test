@@ -12,7 +12,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.3.0"
+#define VERSION @"0.3.1"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -82,6 +82,8 @@ static void loadConfig(void) {
         @"sizeScale": @1.0,
         @"minPointSize": @40,
         @"extendEffects": @YES,
+        @"extendAncestors": @NO,
+        @"alignLayers": @YES,
     } mutableCopy];
     NSString *found = nil;
     for (NSString *p in configCandidates()) {
@@ -272,7 +274,9 @@ static void extendEffects(UILabel *label) {
     for (int i = 0; p && i < 3; i++) {
         CGRect lr = [label.superview convertRect:label.frame toView:p];
         CGFloat bottom = CGRectGetMaxY(lr);
-        if (looksLikeEffect(p) && bottom > p.bounds.size.height + 0.5) {
+        // Growing an ancestor re-centers its content and shifts one clock layer away from the other,
+        // so this is off unless extendAncestors is set in config.plist.
+        if ([gConfig[@"extendAncestors"] boolValue] && looksLikeEffect(p) && bottom > p.bounds.size.height + 0.5) {
             CGRect f = p.frame;
             f.size.height += bottom - p.bounds.size.height;
             p.frame = f;
@@ -291,6 +295,64 @@ static void extendEffects(UILabel *label) {
         }
         child = p;
         p = p.superview;
+    }
+    busy = NO;
+}
+
+// The lock screen draws the clock more than once (a blurred layer behind, a brightening layer in front).
+// Each copy is a UILabel with the same text. After our resize they can end up at different heights, so
+// move every extra copy (with its date, by shifting the whole branch under the common parent) onto the
+// copy that sits highest, which is where the stock clock is.
+static UIView *commonAncestor(UIView *a, UIView *b) {
+    NSMutableSet *chain = [NSMutableSet set];
+    for (UIView *v = a.superview; v; v = v.superview) [chain addObject:v];
+    for (UIView *v = b.superview; v; v = v.superview) if ([chain containsObject:v]) return v;
+    return nil;
+}
+
+static UIView *branchUnder(UIView *ancestor, UIView *v) {
+    while (v && v.superview != ancestor) v = v.superview;
+    return v;
+}
+
+static void alignLayers(void) {
+    static BOOL busy = NO;
+    static NSMutableSet *logged = nil;
+    if (busy || !gActive || ![gConfig[@"alignLayers"] boolValue]) return;
+    busy = YES;
+    NSMutableArray *clocks = [NSMutableArray array];
+    for (UILabel *l in [gLabels allObjects]) {
+        if (l.window && !l.hidden && l.alpha > 0.01 && isLiveClock(l)) [clocks addObject:l];
+    }
+    if (clocks.count >= 2) {
+        UILabel *ref = nil;
+        CGRect refR = CGRectZero;
+        for (UILabel *l in clocks) {
+            CGRect r = [l convertRect:l.bounds toView:nil];
+            if (!ref || r.origin.y < refR.origin.y - 0.5) { ref = l; refR = r; }
+        }
+        for (UILabel *l in clocks) {
+            if (l == ref || l.window != ref.window) continue;
+            CGRect r = [l convertRect:l.bounds toView:nil];
+            BOOL sameShape = fabs(r.size.width - refR.size.width) < 4 && fabs(r.size.height - refR.size.height) < 4;
+            BOOL sameColumn = fabs(r.origin.x - refR.origin.x) < 40;
+            CGFloat dx = refR.origin.x - r.origin.x, dy = refR.origin.y - r.origin.y;
+            if (!sameShape || !sameColumn || fabs(dy) > 600) continue;
+            if (fabs(dx) < 0.5 && fabs(dy) < 0.5) continue;
+            UIView *lca = commonAncestor(ref, l);
+            UIView *branch = lca ? branchUnder(lca, l) : nil;
+            if (!branch) continue;
+            CGRect f = branch.frame;
+            f.origin.x += dx;
+            f.origin.y += dy;
+            branch.frame = f;
+            if (!logged) logged = [NSMutableSet set];
+            NSString *key = [NSString stringWithFormat:@"%@/%.0f", NSStringFromClass([branch class]), dy];
+            if (![logged containsObject:key]) {
+                [logged addObject:key];
+                CFLog(@"aligned layer: moved %@ by (%.1f, %.1f); reference label is in %@, common parent %@", NSStringFromClass([branch class]), dx, dy, NSStringFromClass([ref.superview class]), NSStringFromClass([lca class]));
+            }
+        }
     }
     busy = NO;
 }
@@ -404,7 +466,10 @@ static void reloadIfChanged(void) {
 }
 - (void)layoutSubviews {
     %orig;
-    if (isLiveClock(self)) extendEffects(self);
+    if (isLiveClock(self)) {
+        extendEffects(self);
+        alignLayers();
+    }
 }
 - (void)setBounds:(CGRect)bounds {
     if (!isLiveClock(self)) {
@@ -449,7 +514,10 @@ static void reloadIfChanged(void) {
 
         dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
         dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_SEC / 4);
-        dispatch_source_set_event_handler(timer, ^{ reloadIfChanged(); });
+        dispatch_source_set_event_handler(timer, ^{
+            reloadIfChanged();
+            alignLayers();
+        });
         dispatch_resume(timer);
         objc_setAssociatedObject([NSBundle mainBundle], "ClockFontTimer", timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
