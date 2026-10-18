@@ -1,4 +1,4 @@
-// ClockFont 0.2: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width.
+// ClockFont 0.3: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
 
@@ -12,7 +12,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.2.0"
+#define VERSION @"0.3.0"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -81,6 +81,7 @@ static void loadConfig(void) {
         @"widthFraction": @0.75,
         @"sizeScale": @1.0,
         @"minPointSize": @40,
+        @"extendEffects": @YES,
     } mutableCopy];
     NSString *found = nil;
     for (NSString *p in configCandidates()) {
@@ -222,6 +223,78 @@ static CGRect grownFrame(UILabel *l, CGRect f) {
     return f;
 }
 
+#pragma mark - effect views (blur / vibrancy / masks)
+
+static BOOL looksLikeEffect(UIView *v) {
+    CALayer *l = v.layer;
+    return [v isKindOfClass:[UIVisualEffectView class]] || l.filters.count > 0 || l.backgroundFilters.count > 0 || l.compositingFilter != nil || l.mask != nil;
+}
+
+static NSString *shortDesc(id o) {
+    if (!o) return @"-";
+    NSString *s = [[o description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    return s.length > 90 ? [s substringToIndex:90] : s;
+}
+
+static NSString *describeView(UIView *v) {
+    CALayer *l = v.layer;
+    return [NSString stringWithFormat:@"%@ frame=%@ clip=%d alpha=%.2f filters=%@ bgFilters=%@ comp=%@ mask=%@",
+            NSStringFromClass([v class]), NSStringFromCGRect(v.frame), (int)v.clipsToBounds, v.alpha,
+            l.filters.count ? shortDesc(l.filters) : @"-", l.backgroundFilters.count ? shortDesc(l.backgroundFilters) : @"-",
+            shortDesc(l.compositingFilter), l.mask ? NSStringFromClass([l.mask class]) : @"-"];
+}
+
+static void dumpHierarchy(UILabel *label) {
+    CFLog(@"hierarchy: label %@", describeView(label));
+    UIView *child = label;
+    UIView *p = label.superview;
+    for (int i = 0; p && i < 4; i++) {
+        CFLog(@"  parent%d %@", i, describeView(p));
+        int shown = 0;
+        for (UIView *s in p.subviews) {
+            if (s == child) continue;
+            if (shown++ >= 8) break;
+            CFLog(@"    sibling %@%@", describeView(s), looksLikeEffect(s) ? @" [effect]" : @"");
+        }
+        child = p;
+        p = p.superview;
+    }
+}
+
+// The stock clock has its blur/vibrancy view sized for the stock clock. Stretch those views down
+// so they cover the whole taller clock: effect views next to the label, and effect ancestors.
+static void extendEffects(UILabel *label) {
+    static BOOL busy = NO;
+    if (busy || ![gConfig[@"extendEffects"] boolValue]) return;
+    busy = YES;
+    UIView *child = label;
+    UIView *p = label.superview;
+    for (int i = 0; p && i < 3; i++) {
+        CGRect lr = [label.superview convertRect:label.frame toView:p];
+        CGFloat bottom = CGRectGetMaxY(lr);
+        if (looksLikeEffect(p) && bottom > p.bounds.size.height + 0.5) {
+            CGRect f = p.frame;
+            f.size.height += bottom - p.bounds.size.height;
+            p.frame = f;
+            CFLog(@"extended ancestor %@ to height %.1f", NSStringFromClass([p class]), f.size.height);
+        }
+        for (UIView *s in p.subviews) {
+            if (s == child || !looksLikeEffect(s)) continue;
+            CGRect sr = s.frame;
+            BOOL overlaps = CGRectGetMinX(sr) < CGRectGetMaxX(lr) && CGRectGetMaxX(sr) > CGRectGetMinX(lr) &&
+                            CGRectGetMinY(sr) < CGRectGetMaxY(lr) && CGRectGetMaxY(sr) > CGRectGetMinY(lr);
+            if (overlaps && CGRectGetMaxY(sr) < bottom - 0.5) {
+                sr.size.height += bottom - CGRectGetMaxY(sr);
+                s.frame = sr;
+                CFLog(@"extended sibling %@ to height %.1f", NSStringFromClass([s class]), sr.size.height);
+            }
+        }
+        child = p;
+        p = p.superview;
+    }
+    busy = NO;
+}
+
 static void restyle(UILabel *label, CGFloat curPoint) {
     CGFloat fill = fillSize();
     CGFloat target = fill > 0 ? fill : curPoint * gScale;
@@ -247,6 +320,7 @@ static void restyle(UILabel *label, CGFloat curPoint) {
         [v setNeedsLayout];
         if (i > 0) v.clipsToBounds = NO;
     }
+    extendEffects(label);
 }
 
 static void applyToLabel(UILabel *label) {
@@ -274,6 +348,7 @@ static void applyToLabel(UILabel *label) {
             CFLog(@"after layout: label frame=%@ needed=%@ superview frame=%@ lineHeight=%.1f transform=%@",
                   NSStringFromCGRect(l.frame), NSStringFromCGSize(neededSize(l)), NSStringFromCGRect(l.superview.frame),
                   l.font.lineHeight, NSStringFromCGAffineTransform(l.transform));
+            dumpHierarchy(l);
         });
     }
 }
@@ -326,6 +401,10 @@ static void reloadIfChanged(void) {
 }
 - (void)setFrame:(CGRect)frame {
     %orig(grownFrame(self, frame));
+}
+- (void)layoutSubviews {
+    %orig;
+    if (isLiveClock(self)) extendEffects(self);
 }
 - (void)setBounds:(CGRect)bounds {
     if (!isLiveClock(self)) {
