@@ -328,7 +328,10 @@ static void reloadIfChanged(void) {
     %orig(grownFrame(self, frame));
 }
 - (void)setBounds:(CGRect)bounds {
-    if (!isLiveClock(self)) { %orig; return; }
+    if (!isLiveClock(self)) {
+        %orig;
+        return;
+    }
     CGRect g = bounds;
     CGSize need = neededSize(self);
     CGFloat dh = 0;
