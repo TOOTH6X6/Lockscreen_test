@@ -649,7 +649,7 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
     size_t n = (size_t)w * h;
     uint8_t *mask = calloc(n, 1);
     CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
-    CGContextRef cx = CGBitmapContextCreate(mask, w, h, 8, w, gray, kCGImageAlphaNone);
+    CGContextRef cx = CGBitmapContextCreate(mask, w, h, 8, w, gray, (CGBitmapInfo)kCGImageAlphaNone);
     CGColorSpaceRelease(gray);
     if (!cx) { free(mask); return nil; }
     CGContextTranslateCTM(cx, 0, h);
