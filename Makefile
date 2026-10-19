@@ -9,7 +9,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = ClockFont
 ClockFont_FILES = Tweak.x
-ClockFont_CFLAGS = -fobjc-arc
-ClockFont_FRAMEWORKS = UIKit CoreText
+ClockFont_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+ClockFont_FRAMEWORKS = UIKit CoreText QuartzCore Metal IOSurface
 
 include $(THEOS_MAKE_PATH)/tweak.mk
