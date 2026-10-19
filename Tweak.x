@@ -1,4 +1,4 @@
-// ClockFont 0.5.6: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.7: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -15,7 +15,8 @@
 //   glassTint      Real    white tint alpha over the glass (0.10)
 //   glassEdge      Real    rim light alpha, 0 turns the rim off (0.95)
 //   glassEdgeWidth Real    rim stroke width in pt (1.0)
-//   glassBaseAlpha Real    alpha of the stock vibrant digits under the glass (0.30)
+//   glassBaseAlpha Real    alpha of the stock clock layer under the glass = the colour picked in the lock screen editor,
+//                          drawn through SpringBoard's own blur / vibrancy (0.30 frosted, 0.55 clear; 0.02 = layer hidden)
 //
 // 0.4.0 changes
 //  - FIX: the inner label of SBUILegibilityLabel was pushed left by exactly half its width, because it is first
@@ -23,6 +24,12 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.7: the stock clock colour layer is back under the glass
+//  - Until now glassStyle "clear" hid SpringBoard's own clock (the colour chosen in the lock screen editor, drawn through
+//    its blur / vibrancy view) at alpha 0.02, so the digits showed only the refracting edge. The clear style now keeps
+//    that layer visible at glassBaseAlpha 0.55, and the refraction band is drawn on top of it. Set glassBaseAlpha in
+//    config.plist to taste: 1.0 = full stock colour, 0.02 = hidden again (old 0.5.6 look).
 //
 // 0.5.6: refraction stays, the whitish-grey outline goes
 //  - Cause of the grey-white line: the shader blended the refracted picture towards WHITE while the band fades out
@@ -103,7 +110,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.6"
+#define VERSION @"0.5.7"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -297,7 +304,7 @@ static void loadConfig(void) {
         CFLog(@"no readable config.plist (looked in %@), using defaults", [configCandidates() componentsJoinedByString:@", "]);
     }
     if ([cfg[@"glassStyle"] isEqual:@"clear"]) {
-        NSDictionary *clear = @{ @"glassBlur": @0, @"glassBaseAlpha": @0.02, @"glassTint": @0.02, @"glassSaturation": @1.0,
+        NSDictionary *clear = @{ @"glassBlur": @0, @"glassBaseAlpha": @0.55, @"glassTint": @0.02, @"glassSaturation": @1.0,
                                  @"glassRimStrength": @0, @"glassGlow": @0, @"glassEdge": @0,
                                  @"glassRefractMix": @1.0, @"glassRefractHeight": @6.0, @"glassRefractAmount": @12.0,
                                  @"glassChroma": @1.0, @"glassRimSat": @1.3 };
