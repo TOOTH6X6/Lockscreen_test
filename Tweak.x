@@ -1,4 +1,4 @@
-// ClockFont 0.5.0: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.1: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -22,6 +22,13 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.1: crash safety
+//  - Metal setup (shader compile, UIScreen) no longer runs in the constructor while SpringBoard is still starting;
+//    it runs when the first glass view is created.
+//  - Crash breadcrumbs: risky steps (glass, metal, capture, render) write their name to ClockFont.stage while they run.
+//    If SpringBoard dies in one, the next launch writes it to ClockFont.disabled and keeps that step off.
+//    Delete /var/mobile/Documents/ClockFont.disabled to try again.
 //
 // 0.5.0 changes: refraction
 //  - NEW: Metal layer with a glyph signed-distance-field and the refraction / rim shader from LiquidGlassDock
@@ -61,7 +68,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.0"
+#define VERSION @"0.5.1"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -123,6 +130,63 @@ static void CFLogOnce(NSString *key, NSString *fmt, ...) {
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     CFLog(@"%@", msg);
+}
+
+#pragma mark - crash breadcrumbs
+
+// A SpringBoard crash drops Dopamine into Safe Mode. Risky steps leave their name in STAGE_PATH while they run.
+// A launch that finds a leftover file knows the last name in it was running when SpringBoard died, and disables it.
+#define STAGE_PATH @"/var/mobile/Documents/ClockFont.stage"
+#define DISABLED_PATH @"/var/mobile/Documents/ClockFont.disabled"
+
+static NSMutableArray *gActiveStages = nil;
+static NSMutableSet *gSettledStages = nil;
+static NSMutableSet *gDisabledStages = nil;
+
+static void stageWrite(void) {
+    if (gActiveStages.count == 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:STAGE_PATH error:nil];
+        return;
+    }
+    [[gActiveStages componentsJoinedByString:@","] writeToFile:STAGE_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+static BOOL stageDisabled(NSString *name) {
+    return [gDisabledStages containsObject:name];
+}
+
+// Only the first run of each step per process is tracked, so steady-state frames do no file I/O.
+static void stageBegin(NSString *name) {
+    if ([gSettledStages containsObject:name] || [gActiveStages containsObject:name]) return;
+    [gActiveStages addObject:name];
+    stageWrite();
+}
+
+static void stageEnd(NSString *name) {
+    [gSettledStages addObject:name];
+    if ([gActiveStages containsObject:name]) {
+        [gActiveStages removeObject:name];
+        stageWrite();
+    }
+}
+
+static void stageInit(void) {
+    gActiveStages = [NSMutableArray array];
+    gSettledStages = [NSMutableSet set];
+    gDisabledStages = [NSMutableSet set];
+    NSString *old = [NSString stringWithContentsOfFile:DISABLED_PATH encoding:NSUTF8StringEncoding error:nil];
+    for (NSString *l in [old componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        if (l.length) [gDisabledStages addObject:l];
+    }
+    NSString *left = [NSString stringWithContentsOfFile:STAGE_PATH encoding:NSUTF8StringEncoding error:nil];
+    if (left.length) {
+        NSString *culprit = [[left componentsSeparatedByString:@","] lastObject];
+        if (culprit.length) [gDisabledStages addObject:culprit];
+        [[[gDisabledStages allObjects] componentsJoinedByString:@"\n"] writeToFile:DISABLED_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [[NSFileManager defaultManager] removeItemAtPath:STAGE_PATH error:nil];
+        CFLog(@"previous run ended while these steps were running: %@. Disabling '%@' (delete %@ to retry)", left, culprit, DISABLED_PATH);
+    }
+    if (gDisabledStages.count) CFLog(@"disabled steps: %@", [[gDisabledStages allObjects] componentsJoinedByString:@", "]);
 }
 
 #pragma mark - config and font
@@ -553,6 +617,7 @@ static id<MTLDevice> gDev;
 static id<MTLCommandQueue> gQ;
 static id<MTLRenderPipelineState> gPSO;
 static BOOL gMetalOK = NO;
+static BOOL gRefractWanted = NO;
 static BOOL gRefractOn = NO;
 static CGFloat gPxScale = 3.0;
 
@@ -599,6 +664,19 @@ static BOOL setupBgBuffers(void) {
     }
     CFLog(@"capture: buffers ready %zux%zu", W, H);
     return YES;
+}
+
+// Metal is set up late, when the first glass view is about to be created, not while SpringBoard is still loading.
+static BOOL ensureMetal(void) {
+    if (gMetalOK) return YES;
+    static BOOL tried = NO;
+    if (!gRefractWanted || tried) return NO;
+    tried = YES;
+    stageBegin(@"metal");
+    gMetalOK = setupMetal();
+    stageEnd(@"metal");
+    gRefractOn = gGlassOn && gMetalOK;
+    return gMetalOK;
 }
 
 #pragma mark glyph signed distance field
@@ -769,6 +847,7 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
     if (!CGSizeEqualToSize(_metal.drawableSize, want)) _metal.drawableSize = want;
     id<CAMetalDrawable> dr = [_metal nextDrawable];
     if (!dr) return;
+    stageBegin(@"render");
     _dirty = NO; _lastRect = r; _lastGen = gBgGen;
 
     id<MTLTexture> bgT = gBgFront >= 0 ? gBgTex[gBgFront] : nil;
@@ -805,6 +884,7 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
     [en endEncoding];
     [cb presentDrawable:dr];
     [cb commit];
+    stageEnd(@"render");
     CFLogOnce(@"firstrender", @"metal: first render origin=(%.0f,%.0f) size=%.0fx%.0f bg=%d sdfToPx=%.2f", u.origin.x, u.origin.y, u.size.x, u.size.y, bgT ? 1 : 0, self.sdfToPx);
 }
 @end
@@ -833,7 +913,9 @@ static void captureBackground(BOOL settle) {
         fn = (CARenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
         if (!fn) CFLog(@"capture: CARenderServerRenderDisplay not found, refraction has no picture to bend");
     }
-    if (!fn || !gMetalOK || !setupBgBuffers()) return;
+    if (!fn || !gMetalOK) return;
+    stageBegin(@"capture");
+    if (!setupBgBuffers()) { stageEnd(@"capture"); return; }
     CFTimeInterval t0 = CACurrentMediaTime();
 
     NSMutableArray *labels = [NSMutableArray array], *labelAlpha = [NSMutableArray array], *glassAlpha = [NSMutableArray array];
@@ -861,6 +943,7 @@ static void captureBackground(BOOL settle) {
     gBgFront = back;
     gBgGen++;
     gLastCap = CACurrentMediaTime();
+    stageEnd(@"capture");
     if (logged++ < 6) CFLog(@"capture #%d (%@): %.1f ms with glass hidden", logged, settle ? @"event" : @"live", (gLastCap - t0) * 1000.0);
 }
 
@@ -994,14 +1077,23 @@ static void updateGlass(UILabel *label) {
 
     CFGlassView *g = objc_getAssociatedObject(label, &kGlassKey);
     if (!g) {
+        ensureMetal();
+        stageBegin(@"glass");
+        @try {
+            Class FL = NSClassFromString(@"CAFilter");
+            SEL ft = NSSelectorFromString(@"filterTypes");
+            if (FL && [FL respondsToSelector:ft]) CFLogOnce(@"filtertypes", @"CAFilter types: %@", ((id (*)(id, SEL))objc_msgSend)(FL, ft));
+        } @catch (NSException *e) {}
         g = [[CFGlassView alloc] initGlass];
         if (!g) {
             CFLog(@"liquidGlass: could not create glass view (CABackdropLayer/CAFilter missing?), turning glass off");
             gGlassOn = NO;
+            stageEnd(@"glass");
             return;
         }
         objc_setAssociatedObject(label, &kGlassKey, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [CFGlassDriver startIfNeeded];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ stageEnd(@"glass"); });
     }
     if (g.superview != host) [host addSubview:g];
     else if (host.subviews.lastObject != g) [host bringSubviewToFront:g];
@@ -1210,9 +1302,9 @@ static void reloadIfChanged(void) {
     [gCache removeAllObjects];
     gFillDone = NO;
     gActive = YES;
-    gGlassOn = [gConfig[@"liquidGlass"] boolValue] && glassSupported();
-    if (gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !gMetalOK) gMetalOK = setupMetal();
-    gRefractOn = gGlassOn && gMetalOK && [gConfig[@"glassRefraction"] boolValue];
+    gGlassOn = [gConfig[@"liquidGlass"] boolValue] && !stageDisabled(@"glass") && glassSupported();
+    gRefractWanted = gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !stageDisabled(@"metal") && !stageDisabled(@"capture") && !stageDisabled(@"render");
+    gRefractOn = gRefractWanted && gMetalOK;
     gNeedCapture = YES;
     gCapDue = CACurrentMediaTime() + 0.3;
     [CFGlassDriver stop];
@@ -1273,6 +1365,7 @@ static void reloadIfChanged(void) {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         if (![bid isEqualToString:@"com.apple.springboard"] && ![bid isEqualToString:@"com.apple.PosterBoard"]) return;
         CFLog(@"ClockFont %@ starting in %@", VERSION, bid);
+        stageInit();
         loadConfig();
         if (![gConfig[@"enabled"] boolValue]) return;
         gBaseDesc = findBaseDescriptor();
@@ -1288,15 +1381,9 @@ static void reloadIfChanged(void) {
         CFLog(@"loaded in %@, test font at 80 pt: %@", bid, test ? test.fontName : @"FAILED");
         if (!test) return;
         BOOL canGlass = glassSupported();
-        gGlassOn = [gConfig[@"liquidGlass"] boolValue] && canGlass;
-        if (gGlassOn && [gConfig[@"glassRefraction"] boolValue]) gMetalOK = setupMetal();
-        gRefractOn = gGlassOn && gMetalOK && [gConfig[@"glassRefraction"] boolValue];
-        CFLog(@"liquidGlass: wanted=%@ supported=%d active=%d refraction=%d", gConfig[@"liquidGlass"], (int)canGlass, (int)gGlassOn, (int)gRefractOn);
-        @try {
-            Class FL = NSClassFromString(@"CAFilter");
-            SEL ft = NSSelectorFromString(@"filterTypes");
-            if (FL && [FL respondsToSelector:ft]) CFLog(@"CAFilter types: %@", ((id (*)(id, SEL))objc_msgSend)(FL, ft));
-        } @catch (NSException *e) {}
+        gGlassOn = [gConfig[@"liquidGlass"] boolValue] && !stageDisabled(@"glass") && canGlass;
+        gRefractWanted = gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !stageDisabled(@"metal") && !stageDisabled(@"capture") && !stageDisabled(@"render");
+        CFLog(@"liquidGlass: wanted=%@ supported=%d active=%d refraction wanted=%d (Metal is set up with the first glass view)", gConfig[@"liquidGlass"], (int)canGlass, (int)gGlassOn, (int)gRefractWanted);
         CFNotificationCenterRef dn = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.example.clockfont.recapture"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
