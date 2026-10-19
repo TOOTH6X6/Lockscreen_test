@@ -1,4 +1,4 @@
-// ClockFont 0.5.2: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.4: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -9,7 +9,8 @@
 //   axes           Dict    wght / wdth / HGHT
 //   widthFraction  Real    share of screen width the "00:00" spans (0.75)
 //   liquidGlass    BOOL    glass effect on the clock (YES)
-//   glassBlur      Real    blur radius inside the digits (8)
+//   glassStyle     String  "clear" (see-through, no blur) | "frosted" (blurred body); default clear
+//   glassBlur      Real    blur radius inside the digits, 0 = no blur and no backdrop layer (8 frosted, 0 clear)
 //   glassSaturation Real   colour boost of what shows through the glass (1.8)
 //   glassTint      Real    white tint alpha over the glass (0.10)
 //   glassEdge      Real    rim light alpha, 0 turns the rim off (0.95)
@@ -22,6 +23,18 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.4: clear glass (no blur)
+//  - glassStyle "clear" (default): no blur body at all, the stock digits are hidden (alpha 0.02), almost no veil.
+//    The digits are see-through; only the refracting edge, rim light and glow draw. glassStyle "frosted" = old look.
+//    Explicit keys in config.plist (glassBlur, glassTint, glassBaseAlpha, glassSaturation) override the style.
+//
+// 0.5.3: the log could not show anything new
+//  - The log stopped at 64 KB and the old 0.2-0.3 runs had filled it, so the 0.5.x runs were cut off. It now rotates
+//    (ClockFont.log -> ClockFont.log.1 at 48 KB) instead of going silent.
+//  - The three 0.5.0 starts in the log all die right after the "test font" line, i.e. inside the constructor, before any
+//    "liquidGlass:" or "metal:" line. 0.5.1 moved Metal out of it; this version also moves the CAFilter/CABackdropLayer
+//    support probe out (it runs at the first glass view, under a "support" breadcrumb).
 //
 // 0.5.2: live refraction, no flicker, tracking
 //  - Refraction now samples the picture OUTSIDE the digits (mirrored across the edge), where the glass is never drawn.
@@ -76,7 +89,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.2"
+#define VERSION @"0.5.4"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -114,7 +127,10 @@ static void CFLog(NSString *fmt, ...) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSDictionary *attrs = [fm attributesOfItemAtPath:LOG_PATH error:nil];
-        if (attrs && [attrs fileSize] > 64 * 1024) return;
+        if (attrs && [attrs fileSize] > 48 * 1024) {
+            [fm removeItemAtPath:[LOG_PATH stringByAppendingString:@".1"] error:nil];
+            [fm moveItemAtPath:LOG_PATH toPath:[LOG_PATH stringByAppendingString:@".1"] error:nil];
+        }
         NSString *line = [NSString stringWithFormat:@"%@ [%@] %@\n", [NSDate date], [[NSProcessInfo processInfo] processName], msg];
         NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:LOG_PATH];
         if (!h) {
@@ -217,6 +233,11 @@ static CGFloat cfgNum(NSString *key, CGFloat def) {
     return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : def;
 }
 
+// Alpha of the stock vibrant digits under the glass. Floor 0.02: alignLayers ignores labels at alpha <= 0.01.
+static CGFloat glassBase(void) {
+    return MAX(0.02, cfgNum(@"glassBaseAlpha", 0.30));
+}
+
 static void loadConfig(void) {
     NSMutableDictionary *cfg = [@{
         @"enabled": @YES,
@@ -229,6 +250,7 @@ static void loadConfig(void) {
         @"extendAncestors": @NO,
         @"alignLayers": @YES,
         @"liquidGlass": @YES,
+        @"glassStyle": @"clear",
         @"glassBlur": @8,
         @"glassSaturation": @1.8,
         @"glassTint": @0.10,
@@ -260,11 +282,15 @@ static void loadConfig(void) {
     } else {
         CFLog(@"no readable config.plist (looked in %@), using defaults", [configCandidates() componentsJoinedByString:@", "]);
     }
+    if ([cfg[@"glassStyle"] isEqual:@"clear"]) {
+        NSDictionary *clear = @{ @"glassBlur": @0, @"glassBaseAlpha": @0.02, @"glassTint": @0.03, @"glassSaturation": @1.0 };
+        for (NSString *k in clear) if (![user isKindOfClass:[NSDictionary class]] || !user[k]) cfg[k] = clear[k];
+    }
     gConfig = cfg;
     gScale = [cfg[@"sizeScale"] doubleValue];
     if (gScale <= 0) gScale = 1.0;
     gMinPt = [cfg[@"minPointSize"] doubleValue];
-    CFLog(@"effective: axes=%@ widthFraction=%@ sizeScale=%@ face=%@ liquidGlass=%@", cfg[@"axes"], cfg[@"widthFraction"], cfg[@"sizeScale"], cfg[@"face"], cfg[@"liquidGlass"]);
+    CFLog(@"effective: axes=%@ widthFraction=%@ sizeScale=%@ face=%@ liquidGlass=%@ style=%@ blur=%@ baseAlpha=%@", cfg[@"axes"], cfg[@"widthFraction"], cfg[@"sizeScale"], cfg[@"face"], cfg[@"liquidGlass"], cfg[@"glassStyle"], cfg[@"glassBlur"], cfg[@"glassBaseAlpha"]);
 }
 
 static CTFontDescriptorRef findBaseDescriptor(void) {
@@ -550,8 +576,20 @@ static id makeFilter(NSString *type) {
     return ((id (*)(id, SEL, id))objc_msgSend)(c, sel, type);
 }
 
+static BOOL glassSupportedOnce(void);
 static BOOL glassSupported(void) {
     return NSClassFromString(@"CABackdropLayer") != nil && makeFilter(@"gaussianBlur") != nil;
+}
+
+// Probes CAFilter / CABackdropLayer. Not done in the constructor: SpringBoard is still starting there.
+static BOOL glassSupportedOnce(void) {
+    static int state = -1;
+    if (state >= 0) return state == 1;
+    stageBegin(@"support");
+    state = glassSupported() ? 1 : 0;
+    stageEnd(@"support");
+    CFLog(@"liquidGlass: support check -> %d", state);
+    return state == 1;
 }
 
 #pragma mark metal state and shader
@@ -603,7 +641,7 @@ fragment float4 fmain(float4 pos [[position]], constant U &u [[buffer(0)]], text
     wr = (1.0 - smoothstep(0.0, u.refH, depthIn)) * u.refMix;
   }
   float vy = pos.y / u.size.y;
-  float veil = u.tint + 0.05 * (1.0 - vy);
+  float veil = u.tint * (1.0 + 0.5 * (1.0 - vy));
   float a = max(veil, wr);
   float3 base = mix(float3(1.0), col, wr);
   float glow = exp(-depthIn / (7.0 * u.scale)) * u.glow;
@@ -1052,7 +1090,7 @@ static CADisplayLink *sLink = nil;
 + (void)tick:(CADisplayLink *)link {
     if (!gGlassOn) return;
     @autoreleasepool {
-        CGFloat base = cfgNum(@"glassBaseAlpha", 0.30);
+        CGFloat base = glassBase();
         NSArray *labels = [gLabels allObjects];
         for (UILabel *l in labels) {
             CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
@@ -1144,6 +1182,7 @@ static void updateGlass(UILabel *label) {
 
     CFGlassView *g = objc_getAssociatedObject(label, &kGlassKey);
     if (!g) {
+        if (!glassSupportedOnce()) { gGlassOn = NO; return; }
         ensureMetal();
         stageBegin(@"glass");
         @try {
@@ -1188,7 +1227,8 @@ static void updateGlass(UILabel *label) {
             g.metal.contentsScale = gPxScale;
         }
 
-        @try { [g.blurFilter setValue:@(blur) forKey:@"inputRadius"]; } @catch (NSException *e) {}
+        g.backdrop.hidden = (blur <= 0.01);
+        @try { [g.blurFilter setValue:@(MAX(blur, 0.01)) forKey:@"inputRadius"]; } @catch (NSException *e) {}
         @try { [g.satFilter setValue:@(sat) forKey:@"inputAmount"]; } @catch (NSException *e) {}
         g.backdrop.filters = g.satFilter ? @[g.blurFilter, g.satFilter] : @[g.blurFilter];
 
@@ -1250,7 +1290,7 @@ static void updateGlass(UILabel *label) {
     if (!objc_getAssociatedObject(label, &kBaseAlphaKey)) {
         objc_setAssociatedObject(label, &kBaseAlphaKey, @(label.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    CGFloat base = cfgNum(@"glassBaseAlpha", 0.30);
+    CGFloat base = glassBase();
     if (fabs(label.alpha - base) > 0.005) label.alpha = base;
 }
 
@@ -1387,7 +1427,7 @@ static void reloadIfChanged(void) {
     [gCache removeAllObjects];
     gFillDone = NO;
     gActive = YES;
-    gGlassOn = [gConfig[@"liquidGlass"] boolValue] && !stageDisabled(@"glass") && glassSupported();
+    gGlassOn = [gConfig[@"liquidGlass"] boolValue] && !stageDisabled(@"glass") && !stageDisabled(@"support");
     gRefractWanted = gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !stageDisabled(@"metal") && !stageDisabled(@"capture") && !stageDisabled(@"render");
     gRefractOn = gRefractWanted && gMetalOK;
     gNeedCapture = YES;
@@ -1465,10 +1505,10 @@ static void reloadIfChanged(void) {
         UIFont *test = clockFont(80.0);
         CFLog(@"loaded in %@, test font at 80 pt: %@", bid, test ? test.fontName : @"FAILED");
         if (!test) return;
-        BOOL canGlass = glassSupported();
+        BOOL canGlass = !stageDisabled(@"support");
         gGlassOn = [gConfig[@"liquidGlass"] boolValue] && !stageDisabled(@"glass") && canGlass;
         gRefractWanted = gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !stageDisabled(@"metal") && !stageDisabled(@"capture") && !stageDisabled(@"render");
-        CFLog(@"liquidGlass: wanted=%@ supported=%d active=%d refraction wanted=%d (Metal is set up with the first glass view)", gConfig[@"liquidGlass"], (int)canGlass, (int)gGlassOn, (int)gRefractWanted);
+        CFLog(@"liquidGlass: wanted=%@ allowed=%d active=%d refraction wanted=%d (support probe and Metal run with the first glass view)", gConfig[@"liquidGlass"], (int)canGlass, (int)gGlassOn, (int)gRefractWanted);
         CFNotificationCenterRef dn = CFNotificationCenterGetDarwinNotifyCenter();
         CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.example.clockfont.recapture"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
