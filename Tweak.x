@@ -1,4 +1,4 @@
-// ClockFont 0.5.5: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.6: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -23,6 +23,14 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.6: refraction stays, the whitish-grey outline goes
+//  - Cause of the grey-white line: the shader blended the refracted picture towards WHITE while the band fades out
+//    (base = mix(white, refracted, wr), then multiplied by the same alpha), so the inner half of the band was a milky veil
+//    and the outline read as a light grey line instead of as bent wallpaper.
+//  - Now the band is composited properly: refracted picture over the (faint) veil, premultiplied, with no pull towards
+//    white. The band shows only the bent, colour-fringed wallpaper and fades smoothly into the see-through digit.
+//    Real-time refraction (live capture, per-frame Metal, all glassRefract* keys) is unchanged.
 //
 // 0.5.5: refraction instead of a white rim
 //  - glassStyle "clear" now draws NO white edge: rim light, glow and the fallback edge gradient are 0, and the refracting
@@ -95,7 +103,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.5"
+#define VERSION @"0.5.6"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -651,12 +659,12 @@ fragment float4 fmain(float4 pos [[position]], constant U &u [[buffer(0)]], text
   }
   float vy = pos.y / u.size.y;
   float veil = u.tint * (1.0 + 0.5 * (1.0 - vy));
-  float a = max(veil, wr);
-  float3 base = mix(float3(1.0), col, wr);
+  float a = wr + veil * (1.0 - wr);
+  float3 pm0 = col * wr + float3(1.0) * veil * (1.0 - wr);
   float glow = exp(-depthIn / (7.0 * u.scale)) * u.glow;
   float rim = exp(-depthIn / (1.2 * u.scale)) * pow(abs(dot(n, normalize(float2(-1.0, -1.0)))), 1.5) * u.rim;
   float h = glow + rim;
-  float3 pm = clamp(base * a + float3(h), 0.0, 1.0);
+  float3 pm = clamp(pm0 + float3(h), 0.0, 1.0);
   float aa = clamp(a + h, 0.0, 1.0);
   return float4(pm * alpha, aa * alpha);
 }
