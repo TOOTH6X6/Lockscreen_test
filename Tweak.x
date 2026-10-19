@@ -1,4 +1,4 @@
-// ClockFont 0.5.1: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.2: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -22,6 +22,14 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.2: live refraction, no flicker, tracking
+//  - Refraction now samples the picture OUTSIDE the digits (mirrored across the edge), where the glass is never drawn.
+//    So the capture no longer has to hide the glass: the hide/blink that caused the flicker is gone and the capture can
+//    run continuously (glassLiveFPS, default 15) on a background queue.
+//  - Glass position, size and alpha follow the clock every display frame, from the layers' PRESENTATION values
+//    (in-flight animations), not once per layout / 2 s from model values. The stock digits' alpha is re-applied per frame.
+//  - Log line "clock positions (screen pt)" lists every live clock label and glass, to see which copy is off.
 //
 // 0.5.1: crash safety
 //  - Metal setup (shader compile, UIScreen) no longer runs in the constructor while SpringBoard is still starting;
@@ -48,7 +56,7 @@
 //   glassGlow           Real  soft inner glow near the edge (0.05)
 //   glassRimSat         Real  saturation of the refracted picture (1.25)
 //   glassRimBlur        Real  blur of the refracted picture, pt (1.5)
-//   glassLiveFPS        Real  0 = capture on events only; e.g. 10 = continuous capture (experimental)
+//   glassLiveFPS        Real  background capture rate for the refracted picture (15); 0 = only on events
 //   glassFPS            Real  display-link rate for the Metal layer (60)
 
 #import <UIKit/UIKit.h>
@@ -68,7 +76,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.1"
+#define VERSION @"0.5.2"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -236,7 +244,7 @@ static void loadConfig(void) {
         @"glassGlow": @0.05,
         @"glassRimSat": @1.25,
         @"glassRimBlur": @1.5,
-        @"glassLiveFPS": @0,
+        @"glassLiveFPS": @15,
         @"glassFPS": @60,
     } mutableCopy];
     NSString *found = nil;
@@ -530,11 +538,10 @@ static void alignLayers(void) {
 // The overlay is hosted inside BSUIVibrancyEffectView, next to (not inside) the portal that mirrors the clock,
 // because portals do not carry backdrop layers. The stock vibrant digits underneath are dimmed (glassBaseAlpha).
 //
-// What "real time" means here: the shader runs on every display frame (CADisplayLink) and follows the clock while it
-// moves; the blur body is live. The picture that the rim refracts is a screen capture (CARenderServerRenderDisplay)
-// taken with the glass hidden, because a capture that includes the glass would refract its own rim. Capture runs on
-// events (lock screen shown, lock state change, recapture notification) or, with glassLiveFPS > 0, continuously.
-// Continuous capture has to hide the glass for the length of each capture and can visibly flicker.
+// What "real time" means here: the shader runs on every display frame (CADisplayLink) and follows the clock, including
+// in-flight animations; the blur body is live (render server). The picture the rim refracts is a screen capture
+// (CARenderServerRenderDisplay) refreshed in the background at glassLiveFPS. The rim samples only pixels OUTSIDE the digits,
+// where the glass is never drawn, so the capture contains no glass and nothing has to be hidden while it runs.
 
 static id makeFilter(NSString *type) {
     Class c = NSClassFromString(@"CAFilter");
@@ -585,12 +592,10 @@ fragment float4 fmain(float4 pos [[position]], constant U &u [[buffer(0)]], text
   float3 col = float3(1.0);
   if (u.bgOn > 0.5 && depthIn < u.refH) {
     float x = clamp(1.0 - depthIn / u.refH, 0.0, 1.0);
-    float d = (1.0 - sqrt(1.0 - x * x)) * u.refA;
-    float2 off = d * n;
+    float bend = (1.0 - sqrt(1.0 - x * x)) * u.refA;
+    float2 off = n * (2.0 * depthIn + bend);
     float2 p = pos.xy + u.origin + off;
-    float2 hs = u.size * 0.5;
-    float2 cc = pos.xy - hs;
-    float2 disp = off * u.chroma * (cc.x * cc.y) / (hs.x * hs.y);
+    float2 disp = n * bend * u.chroma * 0.25;
     float3 r = float3(bgTap(bg, p + disp, u.bgSize, u.blurPx).r, bgTap(bg, p, u.bgSize, u.blurPx).g, bgTap(bg, p - disp, u.bgSize, u.blurPx).b);
     float lum = dot(r, float3(0.299, 0.587, 0.114));
     r = mix(float3(lum), r, u.sat);
@@ -765,6 +770,33 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
     return t;
 }
 
+#pragma mark presentation geometry
+
+// Bounding box of `layer` in the coordinate space of `stop` (nil = the root layer, i.e. screen points), computed from the
+// layers' PRESENTATION values so in-flight animations are included. Model values (what convertRect: uses) jump to the end
+// of an animation at once, which is why a glass placed from them runs ahead of the portal-rendered stock clock.
+static CGRect layerRectInAncestor(CALayer *layer, CALayer *stop) {
+    CGRect b = layer.bounds;
+    CGPoint pts[4] = { b.origin, CGPointMake(CGRectGetMaxX(b), b.origin.y), CGPointMake(b.origin.x, CGRectGetMaxY(b)), CGPointMake(CGRectGetMaxX(b), CGRectGetMaxY(b)) };
+    for (CALayer *l = layer; l && l != stop; l = l.superlayer) {
+        CALayer *pl = l.presentationLayer ?: l;
+        CGRect lb = pl.bounds;
+        CGAffineTransform t = CATransform3DGetAffineTransform(pl.transform);
+        CGPoint an = CGPointMake(pl.anchorPoint.x * lb.size.width, pl.anchorPoint.y * lb.size.height);
+        for (int i = 0; i < 4; i++) {
+            CGPoint v = CGPointMake(pts[i].x - lb.origin.x - an.x, pts[i].y - lb.origin.y - an.y);
+            v = CGPointApplyAffineTransform(v, t);
+            pts[i] = CGPointMake(pl.position.x + v.x, pl.position.y + v.y);
+        }
+    }
+    CGFloat x0 = pts[0].x, x1 = pts[0].x, y0 = pts[0].y, y1 = pts[0].y;
+    for (int i = 1; i < 4; i++) {
+        x0 = MIN(x0, pts[i].x); x1 = MAX(x1, pts[i].x);
+        y0 = MIN(y0, pts[i].y); y1 = MAX(y1, pts[i].y);
+    }
+    return CGRectMake(x0, y0, x1 - x0, y1 - y0);
+}
+
 #pragma mark glass view
 
 @interface CFGlassView : UIView
@@ -783,7 +815,10 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
 @property (nonatomic, strong) id blurFilter;
 @property (nonatomic, strong) id satFilter;
 @property (nonatomic, copy) NSString *cacheKey;
+@property (nonatomic, weak) UILabel *label;
+@property (nonatomic, assign) CGRect screenRect;
 - (instancetype)initGlass;
+- (void)syncGeometry;
 - (void)renderIfNeeded;
 @end
 
@@ -834,12 +869,38 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
     return self;
 }
 
+// Place the glass exactly over the clock label, every frame. Position comes from presentation values. Alpha is the product
+// of the layers between the label and the host's direct child: that child is the portal's source and sits at alpha 0 on
+// purpose, so it is skipped; the host's own alpha/hidden state is inherited because the glass is its subview.
+- (void)syncGeometry {
+    UILabel *lab = self.label;
+    UIView *host = self.superview;
+    if (!lab || !host) { if (!self.hidden) self.hidden = YES; return; }
+    CALayer *ll = lab.layer;
+    CGFloat a = 1.0;
+    BOOL hid = lab.hidden || lab.window == nil;
+    for (CALayer *l = ll.superlayer; l && l.superlayer != host.layer; l = l.superlayer) {
+        CALayer *pl = l.presentationLayer ?: l;
+        a *= pl.opacity;
+        if (l.hidden) hid = YES;
+    }
+    BOOL vis = !hid && a > 0.003;
+    CGRect rh = layerRectInAncestor(ll, host.layer);
+    _screenRect = layerRectInAncestor(ll, nil);
+    CGSize sz = lab.bounds.size;
+    CGPoint c = CGPointMake(CGRectGetMidX(rh), CGRectGetMidY(rh));
+    CGFloat na = vis ? a : 0;
+    if (self.hidden == vis) self.hidden = !vis;
+    if (fabs(self.alpha - na) > 0.002) self.alpha = na;
+    if (!CGSizeEqualToSize(self.bounds.size, sz)) self.bounds = CGRectMake(0, 0, sz.width, sz.height);
+    if (fabs(self.center.x - c.x) > 0.01 || fabs(self.center.y - c.y) > 0.01) self.center = c;
+}
+
 // One draw of the glyph glass. Cheap when nothing changed: it returns before touching Metal.
 - (void)renderIfNeeded {
     id<MTLTexture> sdf = self.sdfTex;
     if (!_metal || !sdf || !gPSO || self.hidden || !self.superview) return;
-    CALayer *pl = self.layer.presentationLayer ?: self.layer;
-    CGRect r = [pl convertRect:pl.bounds toLayer:nil];
+    CGRect r = _screenRect;
     if (!_dirty && _lastGen == gBgGen && CGRectEqualToRect(r, _lastRect)) return;
     CGSize pt = self.bounds.size;
     if (pt.width < 2 || pt.height < 2) return;
@@ -857,7 +918,7 @@ static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD)
         .origin = simd_make_float2(r.origin.x * sc, r.origin.y * sc),
         .bgSize = bgT ? simd_make_float2(bgT.width, bgT.height) : simd_make_float2(1, 1),
         .refH = cfgNum(@"glassRefractHeight", 5.0) * sc,
-        .refA = -cfgNum(@"glassRefractAmount", 9.0) * sc,
+        .refA = cfgNum(@"glassRefractAmount", 9.0) * sc,
         .chroma = cfgNum(@"glassChroma", 0.8),
         .scale = sc,
         .tint = cfgNum(@"glassTint", 0.10),
@@ -901,10 +962,13 @@ static BOOL anyGlassVisible(void) {
 
 typedef void (*CARenderDisplayFn)(uint32_t, CFStringRef, IOSurfaceRef, int, int);
 
-// Capture the whole display into the back buffer with the glass (and the stock digits under it) hidden.
-// settle = YES waits 80 ms after hiding so the render server has certainly drawn the hidden state (one visible blink).
-// settle = NO only flushes the transaction: faster, but the hidden frame may reach the screen (flicker) or be missed.
-static void captureBackground(BOOL settle) {
+static dispatch_queue_t gCapQ = nil;
+static BOOL gCapBusy = NO;
+static CFTimeInterval gCapDur = 0.012;
+
+// Capture the whole display into the back buffer on a background queue. Nothing is hidden: the shader only samples pixels
+// outside the digits (see fmain), where the glass is never drawn, so the capture has no glass in it and cannot flicker.
+static void captureBackgroundAsync(void) {
     static CARenderDisplayFn fn = NULL;
     static BOOL tried = NO;
     static int logged = 0;
@@ -913,40 +977,31 @@ static void captureBackground(BOOL settle) {
         fn = (CARenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
         if (!fn) CFLog(@"capture: CARenderServerRenderDisplay not found, refraction has no picture to bend");
     }
-    if (!fn || !gMetalOK) return;
+    if (!fn || !gMetalOK || gCapBusy) return;
     stageBegin(@"capture");
     if (!setupBgBuffers()) { stageEnd(@"capture"); return; }
-    CFTimeInterval t0 = CACurrentMediaTime();
-
-    NSMutableArray *labels = [NSMutableArray array], *labelAlpha = [NSMutableArray array], *glassAlpha = [NSMutableArray array];
-    for (UILabel *l in [gLabels allObjects]) {
-        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
-        if (!g) continue;
-        [labels addObject:l];
-        [labelAlpha addObject:@(l.alpha)];
-        [glassAlpha addObject:@(g.alpha)];
-        g.alpha = 0;
-        l.alpha = 0;
-    }
-    [CATransaction flush];
-    if (settle) [NSThread sleepForTimeInterval:0.08];
+    gCapBusy = YES;
     int back = (gBgFront == 0) ? 1 : 0;
-    fn(0, CFSTR("LCD"), gBgSurf[back], 0, 0);
-    for (NSUInteger i = 0; i < labels.count; i++) {
-        UILabel *l = labels[i];
-        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
-        l.alpha = [labelAlpha[i] doubleValue];
-        if (g) g.alpha = [glassAlpha[i] doubleValue];
-    }
-    [CATransaction flush];
-
-    gBgFront = back;
-    gBgGen++;
-    gLastCap = CACurrentMediaTime();
-    stageEnd(@"capture");
-    if (logged++ < 6) CFLog(@"capture #%d (%@): %.1f ms with glass hidden", logged, settle ? @"event" : @"live", (gLastCap - t0) * 1000.0);
+    IOSurfaceRef surf = gBgSurf[back];
+    if (!gCapQ) gCapQ = dispatch_queue_create("clockfont.capture", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(gCapQ, ^{
+        CFTimeInterval t0 = CACurrentMediaTime();
+        fn(0, CFSTR("LCD"), surf, 0, 0);
+        double dt = CACurrentMediaTime() - t0;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            gBgFront = back;
+            gBgGen++;
+            gLastCap = CACurrentMediaTime();
+            gCapDur = gCapDur * 0.5 + dt * 0.5;
+            gCapBusy = NO;
+            stageEnd(@"capture");
+            if (logged++ < 5) CFLog(@"capture #%d: %.1f ms on a background queue", logged, dt * 1000.0);
+        });
+    });
 }
 
+// Capture when the lock screen shows up and on requests, then every 1/glassLiveFPS seconds. The gap is never shorter than
+// 3x the measured capture time, so the capture cannot eat more than about a third of a core.
 static void serviceCapture(void) {
     if (!gRefractOn) return;
     CFTimeInterval now = CACurrentMediaTime();
@@ -954,15 +1009,15 @@ static void serviceCapture(void) {
     if (!gWasVisible) {
         gWasVisible = YES;
         gNeedCapture = YES;
-        gCapDue = now + 0.7;
+        gCapDue = now + 0.15;
     }
-    if (gNeedCapture && now >= gCapDue) {
+    BOOL due = gNeedCapture && now >= gCapDue;
+    CGFloat fps = cfgNum(@"glassLiveFPS", 15);
+    if (!due && fps > 0 && now - gLastCap >= MAX(1.0 / fps, gCapDur * 3.0)) due = YES;
+    if (due && !gCapBusy) {
         gNeedCapture = NO;
-        captureBackground(YES);
-        return;
+        captureBackgroundAsync();
     }
-    CGFloat fps = cfgNum(@"glassLiveFPS", 0);
-    if (fps > 0 && !gNeedCapture && now - gLastCap >= 1.0 / fps) captureBackground(NO);
 }
 
 static void onRecapture(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef i) {
@@ -983,23 +1038,35 @@ static CADisplayLink *sLink = nil;
 
 @implementation CFGlassDriver
 + (void)startIfNeeded {
-    if (sLink || !gGlassOn || !gRefractOn) return;
+    if (sLink || !gGlassOn) return;
     sLink = [CADisplayLink displayLinkWithTarget:(id)self selector:@selector(tick:)];
     NSInteger fps = (NSInteger)cfgNum(@"glassFPS", 60);
     if (fps > 0) sLink.preferredFramesPerSecond = fps;
     [sLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-    CFLog(@"metal: display link started (%ld fps requested)", (long)fps);
+    CFLog(@"glass: display link started (%ld fps requested)", (long)fps);
 }
 + (void)stop {
     [sLink invalidate];
     sLink = nil;
 }
 + (void)tick:(CADisplayLink *)link {
-    if (!gGlassOn || !gRefractOn) return;
-    serviceCapture();
-    for (UILabel *l in [gLabels allObjects]) {
-        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
-        if (g) [g renderIfNeeded];
+    if (!gGlassOn) return;
+    @autoreleasepool {
+        CGFloat base = cfgNum(@"glassBaseAlpha", 0.30);
+        NSArray *labels = [gLabels allObjects];
+        for (UILabel *l in labels) {
+            CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+            if (!g || !g.superview) continue;
+            [g syncGeometry];
+            // The system can put the stock digits back to alpha 1 (wake, unlock); hold them at the dimmed value every frame.
+            if (objc_getAssociatedObject(l, &kBaseAlphaKey) && fabs(l.alpha - base) > 0.005) l.alpha = base;
+        }
+        if (!gRefractOn) return;
+        serviceCapture();
+        for (UILabel *l in labels) {
+            CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+            if (g) [g renderIfNeeded];
+        }
     }
 }
 @end
@@ -1098,13 +1165,11 @@ static void updateGlass(UILabel *label) {
     if (g.superview != host) [host addSubview:g];
     else if (host.subviews.lastObject != g) [host bringSubviewToFront:g];
 
-    CGRect r = [label convertRect:lb toView:host];
-    g.hidden = label.hidden || label.window == nil;
-
+    g.label = label;
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     g.bounds = CGRectMake(0, 0, lb.size.width, lb.size.height);
-    g.center = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+    [g syncGeometry];
 
     CGFloat blur = cfgNum(@"glassBlur", 8), sat = cfgNum(@"glassSaturation", 1.8);
     CGFloat tint = cfgNum(@"glassTint", 0.10), edge = cfgNum(@"glassEdge", 0.95), edgeW = cfgNum(@"glassEdgeWidth", 1.0);
@@ -1201,7 +1266,27 @@ static void scheduleGlass(UILabel *l) {
     });
 }
 
+// Which clock copies exist and where they are (screen points, presentation values). Logged when the picture changes, max 14 lines.
+static void logClockPositions(void) {
+    static int n = 0;
+    static NSString *last = nil;
+    if (n >= 14) return;
+    NSMutableString *sb = [NSMutableString string];
+    for (UILabel *l in [gLabels allObjects]) {
+        if (!l.window || !isLiveClock(l)) continue;
+        CGRect r = layerRectInAncestor(l.layer, nil);
+        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+        [sb appendFormat:@"[%@ %.1f,%.1f %.1fx%.1f a=%.2f%@] ", NSStringFromClass([l.superview class]), r.origin.x, r.origin.y, r.size.width, r.size.height, l.alpha,
+            g ? [NSString stringWithFormat:@" glass=%.1f,%.1f %.1fx%.1f", g.screenRect.origin.x, g.screenRect.origin.y, g.screenRect.size.width, g.screenRect.size.height] : @""];
+    }
+    if (!sb.length || [sb isEqualToString:last]) return;
+    last = [sb copy];
+    n++;
+    CFLog(@"clock positions (screen pt): %@", sb);
+}
+
 static void updateAllGlass(void) {
+    logClockPositions();
     if (!gGlassOn) return;
     for (UILabel *l in [gLabels allObjects]) if (l.window) updateGlass(l);
 }
