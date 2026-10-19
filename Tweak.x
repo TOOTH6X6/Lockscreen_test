@@ -1,4 +1,4 @@
-// ClockFont 0.5.4: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// ClockFont 0.5.5: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
 // with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
@@ -23,6 +23,12 @@
 //  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
 //  - Log spam from "extended sibling" lines is de-duplicated.
 //  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.5: refraction instead of a white rim
+//  - glassStyle "clear" now draws NO white edge: rim light, glow and the fallback edge gradient are 0, and the refracting
+//    band shows the bent picture at full strength (glassRefractMix 1.0), wider (6 pt) and stronger (12 pt), with more
+//    colour dispersion (glassChroma 1.0). What you see at the edges is the wallpaper bent, not a white outline.
+//    Any of these keys in config.plist still overrides the style; glassRimStrength > 0 brings a highlight back.
 //
 // 0.5.4: clear glass (no blur)
 //  - glassStyle "clear" (default): no blur body at all, the stock digits are hidden (alpha 0.02), almost no veil.
@@ -89,7 +95,7 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.5.4"
+#define VERSION @"0.5.5"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
@@ -283,7 +289,10 @@ static void loadConfig(void) {
         CFLog(@"no readable config.plist (looked in %@), using defaults", [configCandidates() componentsJoinedByString:@", "]);
     }
     if ([cfg[@"glassStyle"] isEqual:@"clear"]) {
-        NSDictionary *clear = @{ @"glassBlur": @0, @"glassBaseAlpha": @0.02, @"glassTint": @0.03, @"glassSaturation": @1.0 };
+        NSDictionary *clear = @{ @"glassBlur": @0, @"glassBaseAlpha": @0.02, @"glassTint": @0.02, @"glassSaturation": @1.0,
+                                 @"glassRimStrength": @0, @"glassGlow": @0, @"glassEdge": @0,
+                                 @"glassRefractMix": @1.0, @"glassRefractHeight": @6.0, @"glassRefractAmount": @12.0,
+                                 @"glassChroma": @1.0, @"glassRimSat": @1.3 };
         for (NSString *k in clear) if (![user isKindOfClass:[NSDictionary class]] || !user[k]) cfg[k] = clear[k];
     }
     gConfig = cfg;
