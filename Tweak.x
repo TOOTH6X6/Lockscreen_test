@@ -1,10 +1,59 @@
-// ClockFont 0.3: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width.
+// ClockFont 0.5.0: lock screen clock in Apple's ADT numeric font (tall digits), sized to the screen width,
+// with an optional "Liquid Glass" look (blurred glass digits, light rim, Metal edge refraction), emulated on iOS 16.
 // Edit config.plist (Filza) and the clock updates within ~2 seconds, no respring needed.
 // Diagnostic log: /var/mobile/Documents/ClockFont.log
+//
+// config.plist keys (all optional):
+//   enabled        BOOL    master switch (needs respring when turned back on)
+//   face           String  .SFAdaptiveNumeric-Regular | .SFAdaptiveSoftNumeric-Regular
+//   axes           Dict    wght / wdth / HGHT
+//   widthFraction  Real    share of screen width the "00:00" spans (0.75)
+//   liquidGlass    BOOL    glass effect on the clock (YES)
+//   glassBlur      Real    blur radius inside the digits (8)
+//   glassSaturation Real   colour boost of what shows through the glass (1.8)
+//   glassTint      Real    white tint alpha over the glass (0.10)
+//   glassEdge      Real    rim light alpha, 0 turns the rim off (0.95)
+//   glassEdgeWidth Real    rim stroke width in pt (1.0)
+//   glassBaseAlpha Real    alpha of the stock vibrant digits under the glass (0.30)
+//
+// 0.4.0 changes
+//  - FIX: the inner label of SBUILegibilityLabel was pushed left by exactly half its width, because it is first
+//    framed at zero width and we grew that frame around its centre. Zero-width frames now keep their left edge.
+//  - FIX: font detection no longer depends on object identity only (UILabel may hand back another instance).
+//  - Log spam from "extended sibling" lines is de-duplicated.
+//  - NEW: Liquid Glass module (private CABackdropLayer + CAFilter, hosted next to the vibrancy portal).
+//
+// 0.5.0 changes: refraction
+//  - NEW: Metal layer with a glyph signed-distance-field and the refraction / rim shader from LiquidGlassDock
+//    (Kyant "Backdrop" port, Apache-2.0, see NOTICE.txt). Drawn on every display frame, only when something changed.
+//  - NEW: background capture for the refraction (CARenderServerRenderDisplay, double buffered, glass hidden while
+//    capturing). Event driven by default; glassLiveFPS > 0 captures continuously (can flicker).
+//  - Makefile: add Metal and IOSurface to the tweak's FRAMEWORKS (QuartzCore is already there).
+//  - Force a new capture: notifyutil -p com.example.clockfont.recapture
+//
+// refraction keys (all optional):
+//   glassRefraction     BOOL  Metal refraction on/off (YES); off = blur + tint + gradient rim only
+//   glassRefractHeight  Real  width of the refracting band along the digit edge, pt (5)
+//   glassRefractAmount  Real  how far the band bends the picture, pt (9)
+//   glassRefractMix     Real  0..1 how much of the bent picture shows in the band (0.7)
+//   glassChroma         Real  colour fringing, 0 = none (0.8)
+//   glassRimStrength    Real  rim light (0.55)
+//   glassGlow           Real  soft inner glow near the edge (0.05)
+//   glassRimSat         Real  saturation of the refracted picture (1.25)
+//   glassRimBlur        Real  blur of the refracted picture, pt (1.5)
+//   glassLiveFPS        Real  0 = capture on events only; e.g. 10 = continuous capture (experimental)
+//   glassFPS            Real  display-link rate for the Metal layer (60)
 
 #import <UIKit/UIKit.h>
 #import <CoreText/CoreText.h>
+#import <QuartzCore/QuartzCore.h>
+#import <QuartzCore/CAMetalLayer.h>
+#import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <dlfcn.h>
+#import <simd/simd.h>
 #if __has_include(<rootless.h>)
 #import <rootless.h>
 #endif
@@ -12,15 +61,20 @@
 #define ROOT_PATH_NS(path) (path)
 #endif
 
-#define VERSION @"0.3.1"
+#define VERSION @"0.5.0"
 #define SUPPORT_DIR ROOT_PATH_NS(@"/Library/ClockFont")
 #define LOG_PATH @"/var/mobile/Documents/ClockFont.log"
 
 static const char kBusyKey;
 static const char kClockKey;
 static const char kOrigKey;
+static const char kGlassKey;      // label -> its glass view
+static const char kGlassMarkKey;  // marker on the glass view itself
+static const char kGlassPendKey;  // coalesced update pending
+static const char kBaseAlphaKey;  // label's alpha before we dimmed it
 
 static BOOL gActive = NO;
+static BOOL gGlassOn = NO;
 static CGFloat gScale = 1.0;
 static CGFloat gMinPt = 40.0;
 static NSDictionary *gConfig = nil;
@@ -58,6 +112,19 @@ static void CFLog(NSString *fmt, ...) {
     } @catch (NSException *e) {}
 }
 
+// Log each distinct message only once per process (used for lines that repeat on every layout pass).
+static void CFLogOnce(NSString *key, NSString *fmt, ...) {
+    static NSMutableSet *done = nil;
+    if (!done) done = [NSMutableSet set];
+    if ([done containsObject:key]) return;
+    [done addObject:key];
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    CFLog(@"%@", msg);
+}
+
 #pragma mark - config and font
 
 static NSArray *configCandidates(void) {
@@ -73,6 +140,11 @@ static NSDate *mtimeOf(NSString *path) {
     return [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileModificationDate];
 }
 
+static CGFloat cfgNum(NSString *key, CGFloat def) {
+    id v = gConfig[key];
+    return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : def;
+}
+
 static void loadConfig(void) {
     NSMutableDictionary *cfg = [@{
         @"enabled": @YES,
@@ -84,6 +156,24 @@ static void loadConfig(void) {
         @"extendEffects": @YES,
         @"extendAncestors": @NO,
         @"alignLayers": @YES,
+        @"liquidGlass": @YES,
+        @"glassBlur": @8,
+        @"glassSaturation": @1.8,
+        @"glassTint": @0.10,
+        @"glassEdge": @0.95,
+        @"glassEdgeWidth": @1.0,
+        @"glassBaseAlpha": @0.30,
+        @"glassRefraction": @YES,
+        @"glassRefractHeight": @5.0,
+        @"glassRefractAmount": @9.0,
+        @"glassRefractMix": @0.7,
+        @"glassChroma": @0.8,
+        @"glassRimStrength": @0.55,
+        @"glassGlow": @0.05,
+        @"glassRimSat": @1.25,
+        @"glassRimBlur": @1.5,
+        @"glassLiveFPS": @0,
+        @"glassFPS": @60,
     } mutableCopy];
     NSString *found = nil;
     for (NSString *p in configCandidates()) {
@@ -102,7 +192,7 @@ static void loadConfig(void) {
     gScale = [cfg[@"sizeScale"] doubleValue];
     if (gScale <= 0) gScale = 1.0;
     gMinPt = [cfg[@"minPointSize"] doubleValue];
-    CFLog(@"effective: axes=%@ widthFraction=%@ sizeScale=%@ face=%@", cfg[@"axes"], cfg[@"widthFraction"], cfg[@"sizeScale"], cfg[@"face"]);
+    CFLog(@"effective: axes=%@ widthFraction=%@ sizeScale=%@ face=%@ liquidGlass=%@", cfg[@"axes"], cfg[@"widthFraction"], cfg[@"sizeScale"], cfg[@"face"], cfg[@"liquidGlass"]);
 }
 
 static CTFontDescriptorRef findBaseDescriptor(void) {
@@ -172,9 +262,11 @@ static UIFont *clockFont(CGFloat size) {
     return font;
 }
 
+// Identity first (cheap), then by name: UILabel does not always hand back the instance we set.
 static BOOL isOurFont(UIFont *f) {
+    if (!f) return NO;
     for (UIFont *ours in [gCache allValues]) if (ours == f) return YES;
-    return NO;
+    return [f.fontName hasPrefix:@".SFAdaptive"];
 }
 
 // Point size at which "00:00" spans widthFraction of the screen width.
@@ -213,12 +305,14 @@ static BOOL isLiveClock(UILabel *l) {
     return gActive && objc_getAssociatedObject(l, &kClockKey) && l.font && isOurFont(l.font);
 }
 
-// Grow a frame to fit the text: keep the top edge and the horizontal center, so it extends downward.
+// Grow a frame to fit the text: keep the top edge, and the horizontal center when the frame already had a width.
+// A zero-width frame (SBUILegibilityLabel frames its inner label that way first) keeps its left edge instead,
+// otherwise the label ends up half its width to the left of where its parent expects it.
 static CGRect grownFrame(UILabel *l, CGRect f) {
     if (!isLiveClock(l)) return f;
     CGSize need = neededSize(l);
     if (f.size.width < need.width) {
-        f.origin.x -= (need.width - f.size.width) / 2.0;
+        if (f.size.width > 1.0) f.origin.x -= (need.width - f.size.width) / 2.0;
         f.size.width = need.width;
     }
     if (f.size.height < need.height) f.size.height = need.height;
@@ -280,17 +374,19 @@ static void extendEffects(UILabel *label) {
             CGRect f = p.frame;
             f.size.height += bottom - p.bounds.size.height;
             p.frame = f;
-            CFLog(@"extended ancestor %@ to height %.1f", NSStringFromClass([p class]), f.size.height);
+            CFLogOnce([NSString stringWithFormat:@"anc/%@/%.0f", NSStringFromClass([p class]), f.size.height],
+                      @"extended ancestor %@ to height %.1f", NSStringFromClass([p class]), f.size.height);
         }
         for (UIView *s in p.subviews) {
-            if (s == child || !looksLikeEffect(s)) continue;
+            if (s == child || objc_getAssociatedObject(s, &kGlassMarkKey) || !looksLikeEffect(s)) continue;
             CGRect sr = s.frame;
             BOOL overlaps = CGRectGetMinX(sr) < CGRectGetMaxX(lr) && CGRectGetMaxX(sr) > CGRectGetMinX(lr) &&
                             CGRectGetMinY(sr) < CGRectGetMaxY(lr) && CGRectGetMaxY(sr) > CGRectGetMinY(lr);
             if (overlaps && CGRectGetMaxY(sr) < bottom - 0.5) {
                 sr.size.height += bottom - CGRectGetMaxY(sr);
                 s.frame = sr;
-                CFLog(@"extended sibling %@ to height %.1f", NSStringFromClass([s class]), sr.size.height);
+                CFLogOnce([NSString stringWithFormat:@"sib/%@/%.0f", NSStringFromClass([s class]), sr.size.height],
+                          @"extended sibling %@ to height %.1f", NSStringFromClass([s class]), sr.size.height);
             }
         }
         child = p;
@@ -357,6 +453,669 @@ static void alignLayers(void) {
     busy = NO;
 }
 
+#pragma mark - liquid glass
+
+// Liquid Glass is an iOS 26 material; iOS 16 has no public API for it. This module emulates it with three layers:
+//  1. a live CABackdropLayer (blur + saturation of whatever is behind the clock, done by the render server every
+//     frame) masked to the digit outlines: the glass body,
+//  2. a Metal layer that evaluates, every frame, a signed distance field of the digits and draws veil, glow, rim light
+//     and EDGE REFRACTION (the wallpaper bent along the outline normal, with colour fringing). The maths is the
+//     refraction / SDF / rim shader of LiquidGlassDock (port of Kyant's "Backdrop", Apache-2.0, see NOTICE.txt),
+//     with the rounded-rectangle SDF replaced by a distance field computed from the glyph outlines,
+//  3. CAShapeLayer tint + gradient rim as a fallback when Metal is unavailable.
+// The overlay is hosted inside BSUIVibrancyEffectView, next to (not inside) the portal that mirrors the clock,
+// because portals do not carry backdrop layers. The stock vibrant digits underneath are dimmed (glassBaseAlpha).
+//
+// What "real time" means here: the shader runs on every display frame (CADisplayLink) and follows the clock while it
+// moves; the blur body is live. The picture that the rim refracts is a screen capture (CARenderServerRenderDisplay)
+// taken with the glass hidden, because a capture that includes the glass would refract its own rim. Capture runs on
+// events (lock screen shown, lock state change, recapture notification) or, with glassLiveFPS > 0, continuously.
+// Continuous capture has to hide the glass for the length of each capture and can visibly flicker.
+
+static id makeFilter(NSString *type) {
+    Class c = NSClassFromString(@"CAFilter");
+    SEL sel = NSSelectorFromString(@"filterWithType:");
+    if (!c || ![c respondsToSelector:sel]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(c, sel, type);
+}
+
+static BOOL glassSupported(void) {
+    return NSClassFromString(@"CABackdropLayer") != nil && makeFilter(@"gaussianBlur") != nil;
+}
+
+#pragma mark metal state and shader
+
+#define LG_TAG(...) @#__VA_ARGS__
+
+static NSString *const kMSL = LG_TAG(
+struct U { float2 size; float2 origin; float2 bgSize; float refH; float refA; float chroma; float scale; float tint; float sat; float rim; float glow; float refMix; float sdfToPx; float blurPx; float bgOn; };
+float3 bgTap(texture2d<float> t, float2 p, float2 sz, float r) {
+  constexpr sampler s(filter::linear, address::clamp_to_edge);
+  float3 c = t.sample(s, p / sz).rgb;
+  if (r > 0.01) {
+    c += t.sample(s, (p + float2(r, 0.0)) / sz).rgb;
+    c += t.sample(s, (p - float2(r, 0.0)) / sz).rgb;
+    c += t.sample(s, (p + float2(0.0, r)) / sz).rgb;
+    c += t.sample(s, (p - float2(0.0, r)) / sz).rgb;
+    c *= 0.2;
+  }
+  return c;
+}
+vertex float4 vmain(uint v [[vertex_id]]) {
+  float2 p = float2((v << 1) & 2, v & 2);
+  return float4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+fragment float4 fmain(float4 pos [[position]], constant U &u [[buffer(0)]], texture2d<float> sdfT [[texture(0)]], texture2d<float> bg [[texture(1)]]) {
+  constexpr sampler ls(filter::linear, address::clamp_to_edge);
+  float2 uv = pos.xy / u.size;
+  float sd = sdfT.sample(ls, uv).r * u.sdfToPx;
+  float alpha = clamp(0.5 - sd, 0.0, 1.0);
+  if (alpha <= 0.0) return float4(0.0);
+  float depthIn = -min(sd, 0.0);
+  float2 e = 1.0 / float2(sdfT.get_width(), sdfT.get_height());
+  float2 gr = float2(sdfT.sample(ls, uv + float2(e.x, 0.0)).r - sdfT.sample(ls, uv - float2(e.x, 0.0)).r,
+                     sdfT.sample(ls, uv + float2(0.0, e.y)).r - sdfT.sample(ls, uv - float2(0.0, e.y)).r);
+  float gl = length(gr);
+  float2 n = gl > 1e-4 ? gr / gl : float2(0.0);
+  float wr = 0.0;
+  float3 col = float3(1.0);
+  if (u.bgOn > 0.5 && depthIn < u.refH) {
+    float x = clamp(1.0 - depthIn / u.refH, 0.0, 1.0);
+    float d = (1.0 - sqrt(1.0 - x * x)) * u.refA;
+    float2 off = d * n;
+    float2 p = pos.xy + u.origin + off;
+    float2 hs = u.size * 0.5;
+    float2 cc = pos.xy - hs;
+    float2 disp = off * u.chroma * (cc.x * cc.y) / (hs.x * hs.y);
+    float3 r = float3(bgTap(bg, p + disp, u.bgSize, u.blurPx).r, bgTap(bg, p, u.bgSize, u.blurPx).g, bgTap(bg, p - disp, u.bgSize, u.blurPx).b);
+    float lum = dot(r, float3(0.299, 0.587, 0.114));
+    r = mix(float3(lum), r, u.sat);
+    col = mix(r, float3(1.0), u.tint);
+    wr = (1.0 - smoothstep(0.0, u.refH, depthIn)) * u.refMix;
+  }
+  float vy = pos.y / u.size.y;
+  float veil = u.tint + 0.05 * (1.0 - vy);
+  float a = max(veil, wr);
+  float3 base = mix(float3(1.0), col, wr);
+  float glow = exp(-depthIn / (7.0 * u.scale)) * u.glow;
+  float rim = exp(-depthIn / (1.2 * u.scale)) * pow(abs(dot(n, normalize(float2(-1.0, -1.0)))), 1.5) * u.rim;
+  float h = glow + rim;
+  float3 pm = clamp(base * a + float3(h), 0.0, 1.0);
+  float aa = clamp(a + h, 0.0, 1.0);
+  return float4(pm * alpha, aa * alpha);
+}
+);
+
+// Must match struct U in the shader above (3 x float2, then 12 floats).
+typedef struct { simd_float2 size; simd_float2 origin; simd_float2 bgSize; float refH, refA, chroma, scale, tint, sat, rim, glow, refMix, sdfToPx, blurPx, bgOn; } LGU;
+
+static id<MTLDevice> gDev;
+static id<MTLCommandQueue> gQ;
+static id<MTLRenderPipelineState> gPSO;
+static BOOL gMetalOK = NO;
+static BOOL gRefractOn = NO;
+static CGFloat gPxScale = 3.0;
+
+// Background capture, double buffered so the renderer never reads a surface that is being written.
+static IOSurfaceRef gBgSurf[2];
+static id<MTLTexture> gBgTex[2];
+static int gBgFront = -1;
+static NSUInteger gBgGen = 0;
+static BOOL gNeedCapture = YES;
+static CFTimeInterval gCapDue = 0, gLastCap = 0;
+static BOOL gWasVisible = NO;
+
+static BOOL setupMetal(void) {
+    gDev = MTLCreateSystemDefaultDevice();
+    if (!gDev) { CFLog(@"metal: no device"); return NO; }
+    gQ = [gDev newCommandQueue];
+    NSError *e = nil;
+    NSString *src = [@"#include <metal_stdlib>\nusing namespace metal;\n" stringByAppendingString:kMSL];
+    id<MTLLibrary> lib = [gDev newLibraryWithSource:src options:nil error:&e];
+    if (!lib) { CFLog(@"metal: MSL compile error: %@", e); return NO; }
+    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+    pd.vertexFunction = [lib newFunctionWithName:@"vmain"];
+    pd.fragmentFunction = [lib newFunctionWithName:@"fmain"];
+    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    gPSO = [gDev newRenderPipelineStateWithDescriptor:pd error:&e];
+    if (!gPSO) { CFLog(@"metal: pipeline error: %@", e); return NO; }
+    gPxScale = UIScreen.mainScreen.nativeScale;
+    CFLog(@"metal: ready (device %@, nativeScale %.2f)", gDev.name, gPxScale);
+    return YES;
+}
+
+static BOOL setupBgBuffers(void) {
+    if (gBgSurf[0] && gBgSurf[1]) return YES;
+    UIScreen *s = UIScreen.mainScreen;
+    size_t W = (size_t)s.nativeBounds.size.width, H = (size_t)s.nativeBounds.size.height;
+    for (int i = 0; i < 2; i++) {
+        NSDictionary *props = @{ (id)kIOSurfaceWidth: @(W), (id)kIOSurfaceHeight: @(H), (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfacePixelFormat: @(0x42475241) };
+        gBgSurf[i] = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!gBgSurf[i]) { CFLog(@"capture: IOSurfaceCreate failed"); return NO; }
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:W height:H mipmapped:NO];
+        td.usage = MTLTextureUsageShaderRead;
+        gBgTex[i] = [gDev newTextureWithDescriptor:td iosurface:gBgSurf[i] plane:0];
+        if (!gBgTex[i]) { CFLog(@"capture: texture from IOSurface failed"); return NO; }
+    }
+    CFLog(@"capture: buffers ready %zux%zu", W, H);
+    return YES;
+}
+
+#pragma mark glyph signed distance field
+
+// Felzenszwalb & Huttenlocher exact squared Euclidean distance transform, 1D pass.
+static void edt1d(const float *f, float *d, int n, int *v, float *z) {
+    const float INF = 1e20f;
+    int k = 0;
+    v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (int q = 1; q < n; q++) {
+        float s = ((f[q] + (float)q * q) - (f[v[k]] + (float)v[k] * v[k])) / (2.0f * q - 2.0f * v[k]);
+        while (s <= z[k]) {
+            k--;
+            s = ((f[q] + (float)q * q) - (f[v[k]] + (float)v[k] * v[k])) / (2.0f * q - 2.0f * v[k]);
+        }
+        k++;
+        v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (int q = 0; q < n; q++) {
+        while (z[k + 1] < q) k++;
+        float dx = (float)(q - v[k]);
+        d[q] = dx * dx + f[v[k]];
+    }
+}
+
+static void edt2d(float *f, int w, int h) {
+    int m = MAX(w, h);
+    float *col = malloc(sizeof(float) * m), *out = malloc(sizeof(float) * m), *z = malloc(sizeof(float) * (m + 1));
+    int *v = malloc(sizeof(int) * m);
+    for (int x = 0; x < w; x++) {
+        for (int y = 0; y < h; y++) col[y] = f[(size_t)y * w + x];
+        edt1d(col, out, h, v, z);
+        for (int y = 0; y < h; y++) f[(size_t)y * w + x] = out[y];
+    }
+    for (int y = 0; y < h; y++) {
+        edt1d(f + (size_t)y * w, out, w, v, z);
+        memcpy(f + (size_t)y * w, out, sizeof(float) * w);
+    }
+    free(col); free(out); free(z); free(v);
+}
+
+// Signed distance (pixels of the SDF texture, negative inside) of `path`, drawn at `s` px per point, as an R16Float texture.
+// Runs on a background queue; the path is in label coordinates (y down) and `pt` is the label size.
+static id<MTLTexture> buildSDF(CGPathRef path, CGSize pt, CGFloat s, float maxD) {
+    int w = (int)ceil(pt.width * s), h = (int)ceil(pt.height * s);
+    if (w < 4 || h < 4 || w > 2400 || h > 2400) return nil;
+    size_t n = (size_t)w * h;
+    uint8_t *mask = calloc(n, 1);
+    CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+    CGContextRef cx = CGBitmapContextCreate(mask, w, h, 8, w, gray, kCGImageAlphaNone);
+    CGColorSpaceRelease(gray);
+    if (!cx) { free(mask); return nil; }
+    CGContextTranslateCTM(cx, 0, h);
+    CGContextScaleCTM(cx, s, -s);
+    CGContextSetGrayFillColor(cx, 1.0, 1.0);
+    CGContextAddPath(cx, path);
+    CGContextFillPath(cx);
+    CGContextRelease(cx);
+
+    float *dOut = malloc(n * sizeof(float)), *dIn = malloc(n * sizeof(float));
+    BOOL any = NO;
+    for (size_t i = 0; i < n; i++) {
+        BOOL in = mask[i] > 127;
+        if (in) any = YES;
+        dOut[i] = in ? 0.0f : 1e20f;
+        dIn[i] = in ? 1e20f : 0.0f;
+    }
+    free(mask);
+    if (!any) { free(dOut); free(dIn); return nil; }
+    edt2d(dOut, w, h);
+    edt2d(dIn, w, h);
+
+    __fp16 *half = malloc(n * sizeof(__fp16));
+    for (size_t i = 0; i < n; i++) {
+        float sdv = dOut[i] < 0.5f ? -(sqrtf(dIn[i]) - 0.5f) : (sqrtf(dOut[i]) - 0.5f);
+        half[i] = (__fp16)fmaxf(-maxD, fminf(maxD, sdv));
+    }
+    free(dOut); free(dIn);
+
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:w height:h mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [gDev newTextureWithDescriptor:td];
+    [t replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:half bytesPerRow:(size_t)w * sizeof(__fp16)];
+    free(half);
+    return t;
+}
+
+#pragma mark glass view
+
+@interface CFGlassView : UIView
+@property (nonatomic, strong) CALayer *backdrop;
+@property (nonatomic, strong) CAShapeLayer *fillMask;
+@property (nonatomic, strong) CAShapeLayer *tintShape;
+@property (nonatomic, strong) CAGradientLayer *edgeGradient;
+@property (nonatomic, strong) CAShapeLayer *edgeShape;
+@property (nonatomic, strong) CAMetalLayer *metal;
+@property (nonatomic, strong) id sdfTex;
+@property (nonatomic, assign) float sdfToPx;
+@property (nonatomic, assign) NSUInteger sdfToken;
+@property (nonatomic, assign) BOOL dirty;
+@property (nonatomic, assign) CGRect lastRect;
+@property (nonatomic, assign) NSUInteger lastGen;
+@property (nonatomic, strong) id blurFilter;
+@property (nonatomic, strong) id satFilter;
+@property (nonatomic, copy) NSString *cacheKey;
+- (instancetype)initGlass;
+- (void)renderIfNeeded;
+@end
+
+@implementation CFGlassView
+- (instancetype)initGlass {
+    self = [super initWithFrame:CGRectZero];
+    if (!self) return nil;
+    self.userInteractionEnabled = NO;
+    self.clipsToBounds = NO;
+    self.backgroundColor = [UIColor clearColor];
+    objc_setAssociatedObject(self, &kGlassMarkKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    Class bc = NSClassFromString(@"CABackdropLayer");
+    _blurFilter = makeFilter(@"gaussianBlur");
+    _satFilter = makeFilter(@"colorSaturate");
+    if (!bc || !_blurFilter) return nil;
+    @try { [_blurFilter setValue:@YES forKey:@"inputNormalizeEdges"]; } @catch (NSException *e) {}
+
+    _backdrop = [bc layer];
+    @try { [_backdrop setValue:@YES forKey:@"windowServerAware"]; } @catch (NSException *e) {}
+    _fillMask = [CAShapeLayer layer];
+    _fillMask.fillColor = [UIColor whiteColor].CGColor;
+    _backdrop.mask = _fillMask;
+    [self.layer addSublayer:_backdrop];
+
+    _tintShape = [CAShapeLayer layer];
+    [self.layer addSublayer:_tintShape];
+
+    _edgeGradient = [CAGradientLayer layer];
+    _edgeGradient.startPoint = CGPointMake(0.0, 0.0);
+    _edgeGradient.endPoint = CGPointMake(1.0, 1.0);
+    _edgeShape = [CAShapeLayer layer];
+    _edgeShape.fillColor = nil;
+    _edgeShape.strokeColor = [UIColor whiteColor].CGColor;
+    _edgeShape.lineJoin = kCALineJoinRound;
+    _edgeGradient.mask = _edgeShape;
+    [self.layer addSublayer:_edgeGradient];
+
+    if (gRefractOn) {
+        _metal = [CAMetalLayer layer];
+        _metal.device = gDev;
+        _metal.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        _metal.framebufferOnly = YES;
+        _metal.opaque = NO;
+        _metal.contentsScale = gPxScale;
+        [self.layer addSublayer:_metal];
+    }
+    return self;
+}
+
+// One draw of the glyph glass. Cheap when nothing changed: it returns before touching Metal.
+- (void)renderIfNeeded {
+    id<MTLTexture> sdf = self.sdfTex;
+    if (!_metal || !sdf || !gPSO || self.hidden || !self.superview) return;
+    CALayer *pl = self.layer.presentationLayer ?: self.layer;
+    CGRect r = [pl convertRect:pl.bounds toLayer:nil];
+    if (!_dirty && _lastGen == gBgGen && CGRectEqualToRect(r, _lastRect)) return;
+    CGSize pt = self.bounds.size;
+    if (pt.width < 2 || pt.height < 2) return;
+    CGSize want = CGSizeMake(ceil(pt.width * gPxScale), ceil(pt.height * gPxScale));
+    if (!CGSizeEqualToSize(_metal.drawableSize, want)) _metal.drawableSize = want;
+    id<CAMetalDrawable> dr = [_metal nextDrawable];
+    if (!dr) return;
+    _dirty = NO; _lastRect = r; _lastGen = gBgGen;
+
+    id<MTLTexture> bgT = gBgFront >= 0 ? gBgTex[gBgFront] : nil;
+    CGFloat sc = gPxScale;
+    LGU u = {
+        .size = simd_make_float2(want.width, want.height),
+        .origin = simd_make_float2(r.origin.x * sc, r.origin.y * sc),
+        .bgSize = bgT ? simd_make_float2(bgT.width, bgT.height) : simd_make_float2(1, 1),
+        .refH = cfgNum(@"glassRefractHeight", 5.0) * sc,
+        .refA = -cfgNum(@"glassRefractAmount", 9.0) * sc,
+        .chroma = cfgNum(@"glassChroma", 0.8),
+        .scale = sc,
+        .tint = cfgNum(@"glassTint", 0.10),
+        .sat = cfgNum(@"glassRimSat", 1.25),
+        .rim = cfgNum(@"glassRimStrength", 0.55),
+        .glow = cfgNum(@"glassGlow", 0.05),
+        .refMix = cfgNum(@"glassRefractMix", 0.7),
+        .sdfToPx = self.sdfToPx,
+        .blurPx = cfgNum(@"glassRimBlur", 1.5) * sc,
+        .bgOn = bgT ? 1.0f : 0.0f,
+    };
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dr.texture;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    id<MTLCommandBuffer> cb = [gQ commandBuffer];
+    id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    [en setRenderPipelineState:gPSO];
+    [en setFragmentBytes:&u length:sizeof(u) atIndex:0];
+    [en setFragmentTexture:sdf atIndex:0];
+    [en setFragmentTexture:(bgT ?: sdf) atIndex:1];
+    [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [en endEncoding];
+    [cb presentDrawable:dr];
+    [cb commit];
+    CFLogOnce(@"firstrender", @"metal: first render origin=(%.0f,%.0f) size=%.0fx%.0f bg=%d sdfToPx=%.2f", u.origin.x, u.origin.y, u.size.x, u.size.y, bgT ? 1 : 0, self.sdfToPx);
+}
+@end
+
+#pragma mark capture
+
+static BOOL anyGlassVisible(void) {
+    for (UILabel *l in [gLabels allObjects]) {
+        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+        if (g && g.superview && !g.hidden && l.window && !l.window.hidden && l.window.alpha > 0.01) return YES;
+    }
+    return NO;
+}
+
+typedef void (*CARenderDisplayFn)(uint32_t, CFStringRef, IOSurfaceRef, int, int);
+
+// Capture the whole display into the back buffer with the glass (and the stock digits under it) hidden.
+// settle = YES waits 80 ms after hiding so the render server has certainly drawn the hidden state (one visible blink).
+// settle = NO only flushes the transaction: faster, but the hidden frame may reach the screen (flicker) or be missed.
+static void captureBackground(BOOL settle) {
+    static CARenderDisplayFn fn = NULL;
+    static BOOL tried = NO;
+    static int logged = 0;
+    if (!tried) {
+        tried = YES;
+        fn = (CARenderDisplayFn)dlsym(RTLD_DEFAULT, "CARenderServerRenderDisplay");
+        if (!fn) CFLog(@"capture: CARenderServerRenderDisplay not found, refraction has no picture to bend");
+    }
+    if (!fn || !gMetalOK || !setupBgBuffers()) return;
+    CFTimeInterval t0 = CACurrentMediaTime();
+
+    NSMutableArray *labels = [NSMutableArray array], *labelAlpha = [NSMutableArray array], *glassAlpha = [NSMutableArray array];
+    for (UILabel *l in [gLabels allObjects]) {
+        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+        if (!g) continue;
+        [labels addObject:l];
+        [labelAlpha addObject:@(l.alpha)];
+        [glassAlpha addObject:@(g.alpha)];
+        g.alpha = 0;
+        l.alpha = 0;
+    }
+    [CATransaction flush];
+    if (settle) [NSThread sleepForTimeInterval:0.08];
+    int back = (gBgFront == 0) ? 1 : 0;
+    fn(0, CFSTR("LCD"), gBgSurf[back], 0, 0);
+    for (NSUInteger i = 0; i < labels.count; i++) {
+        UILabel *l = labels[i];
+        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+        l.alpha = [labelAlpha[i] doubleValue];
+        if (g) g.alpha = [glassAlpha[i] doubleValue];
+    }
+    [CATransaction flush];
+
+    gBgFront = back;
+    gBgGen++;
+    gLastCap = CACurrentMediaTime();
+    if (logged++ < 6) CFLog(@"capture #%d (%@): %.1f ms with glass hidden", logged, settle ? @"event" : @"live", (gLastCap - t0) * 1000.0);
+}
+
+static void serviceCapture(void) {
+    if (!gRefractOn) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (!anyGlassVisible()) { gWasVisible = NO; return; }
+    if (!gWasVisible) {
+        gWasVisible = YES;
+        gNeedCapture = YES;
+        gCapDue = now + 0.7;
+    }
+    if (gNeedCapture && now >= gCapDue) {
+        gNeedCapture = NO;
+        captureBackground(YES);
+        return;
+    }
+    CGFloat fps = cfgNum(@"glassLiveFPS", 0);
+    if (fps > 0 && !gNeedCapture && now - gLastCap >= 1.0 / fps) captureBackground(NO);
+}
+
+static void onRecapture(CFNotificationCenterRef c, void *o, CFNotificationName n, const void *obj, CFDictionaryRef i) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gNeedCapture = YES;
+        gCapDue = CACurrentMediaTime() + 0.8;
+    });
+}
+
+#pragma mark display link driver
+
+@interface CFGlassDriver : NSObject
++ (void)startIfNeeded;
++ (void)stop;
+@end
+
+static CADisplayLink *sLink = nil;
+
+@implementation CFGlassDriver
++ (void)startIfNeeded {
+    if (sLink || !gGlassOn || !gRefractOn) return;
+    sLink = [CADisplayLink displayLinkWithTarget:(id)self selector:@selector(tick:)];
+    NSInteger fps = (NSInteger)cfgNum(@"glassFPS", 60);
+    if (fps > 0) sLink.preferredFramesPerSecond = fps;
+    [sLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    CFLog(@"metal: display link started (%ld fps requested)", (long)fps);
+}
++ (void)stop {
+    [sLink invalidate];
+    sLink = nil;
+}
++ (void)tick:(CADisplayLink *)link {
+    if (!gGlassOn || !gRefractOn) return;
+    serviceCapture();
+    for (UILabel *l in [gLabels allObjects]) {
+        CFGlassView *g = objc_getAssociatedObject(l, &kGlassKey);
+        if (g) [g renderIfNeeded];
+    }
+}
+@end
+
+#pragma mark glass layout
+
+// Outline of `text` in `font` as a path in label coordinates (y down). baselineY is measured from the label's top.
+static CGPathRef newGlyphPath(NSString *text, UIFont *font, NSTextAlignment align, CGFloat boundsWidth, CGFloat baselineY) {
+    NSAttributedString *as = [[NSAttributedString alloc] initWithString:text attributes:@{ (__bridge id)kCTFontAttributeName: font }];
+    CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+    if (!line) return NULL;
+    CGFloat lineW = CTLineGetTypographicBounds(line, NULL, NULL, NULL);
+    CGFloat x0 = 0;
+    if (align == NSTextAlignmentCenter) x0 = (boundsWidth - lineW) / 2.0;
+    else if (align == NSTextAlignmentRight) x0 = boundsWidth - lineW;
+
+    CGMutablePathRef path = CGPathCreateMutable();
+    CFArrayRef runs = CTLineGetGlyphRuns(line);
+    for (CFIndex r = 0; r < CFArrayGetCount(runs); r++) {
+        CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(runs, r);
+        CFIndex n = CTRunGetGlyphCount(run);
+        if (n <= 0) continue;
+        CTFontRef rf = (CTFontRef)CFDictionaryGetValue(CTRunGetAttributes(run), kCTFontAttributeName);
+        if (!rf) continue;
+        CGGlyph glyphs[n];
+        CGPoint pos[n];
+        CTRunGetGlyphs(run, CFRangeMake(0, 0), glyphs);
+        CTRunGetPositions(run, CFRangeMake(0, 0), pos);
+        for (CFIndex i = 0; i < n; i++) {
+            CGPathRef gp = CTFontCreatePathForGlyph(rf, glyphs[i], NULL);
+            if (!gp) continue;
+            CGAffineTransform t = CGAffineTransformMake(1, 0, 0, -1, x0 + pos[i].x, baselineY - pos[i].y);
+            CGPathAddPath(path, &t, gp);
+            CGPathRelease(gp);
+        }
+    }
+    CFRelease(line);
+    return path;
+}
+
+static UIView *glassHostFor(UILabel *label) {
+    Class vc = NSClassFromString(@"BSUIVibrancyEffectView");
+    if (!vc) return nil;
+    UIView *v = label.superview;
+    for (int i = 0; v && i < 8; i++, v = v.superview) if ([v isKindOfClass:vc]) return v;
+    return nil;
+}
+
+static void removeGlass(UILabel *label) {
+    CFGlassView *g = objc_getAssociatedObject(label, &kGlassKey);
+    if (g) {
+        g.sdfToken++;
+        [g removeFromSuperview];
+        objc_setAssociatedObject(label, &kGlassKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    NSNumber *orig = objc_getAssociatedObject(label, &kBaseAlphaKey);
+    if (orig) {
+        label.alpha = [orig doubleValue];
+        objc_setAssociatedObject(label, &kBaseAlphaKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void updateGlass(UILabel *label) {
+    if (!gGlassOn || !label || !isLiveClock(label)) return;
+    UIView *host = glassHostFor(label);
+    if (!host) {
+        CFLogOnce([NSString stringWithFormat:@"nohost/%@", NSStringFromClass([label class])],
+                  @"liquidGlass: %@ has no BSUIVibrancyEffectView ancestor, glass skipped for it", NSStringFromClass([label class]));
+        return;
+    }
+    NSString *text = label.text.length ? label.text : label.attributedText.string;
+    UIFont *font = label.font;
+    CGRect lb = label.bounds;
+    if (!text.length || !font || lb.size.width < 2 || lb.size.height < 2) return;
+
+    CFGlassView *g = objc_getAssociatedObject(label, &kGlassKey);
+    if (!g) {
+        g = [[CFGlassView alloc] initGlass];
+        if (!g) {
+            CFLog(@"liquidGlass: could not create glass view (CABackdropLayer/CAFilter missing?), turning glass off");
+            gGlassOn = NO;
+            return;
+        }
+        objc_setAssociatedObject(label, &kGlassKey, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [CFGlassDriver startIfNeeded];
+    }
+    if (g.superview != host) [host addSubview:g];
+    else if (host.subviews.lastObject != g) [host bringSubviewToFront:g];
+
+    CGRect r = [label convertRect:lb toView:host];
+    g.hidden = label.hidden || label.window == nil;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    g.bounds = CGRectMake(0, 0, lb.size.width, lb.size.height);
+    g.center = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+
+    CGFloat blur = cfgNum(@"glassBlur", 8), sat = cfgNum(@"glassSaturation", 1.8);
+    CGFloat tint = cfgNum(@"glassTint", 0.10), edge = cfgNum(@"glassEdge", 0.95), edgeW = cfgNum(@"glassEdgeWidth", 1.0);
+    NSString *key = [NSString stringWithFormat:@"%@|%.2f|%.1f|%.1f|%ld|%.2f|%.2f|%.2f|%.2f|%.2f",
+                     text, font.pointSize, lb.size.width, lb.size.height, (long)label.textAlignment, blur, sat, tint, edge, edgeW];
+    if (![key isEqualToString:g.cacheKey]) {
+        g.cacheKey = key;
+        CGRect full = g.bounds;
+        g.backdrop.frame = full;
+        g.fillMask.frame = full;
+        g.tintShape.frame = full;
+        g.edgeGradient.frame = full;
+        g.edgeShape.frame = full;
+        if (g.metal) {
+            g.metal.frame = full;
+            g.metal.contentsScale = gPxScale;
+        }
+
+        @try { [g.blurFilter setValue:@(blur) forKey:@"inputRadius"]; } @catch (NSException *e) {}
+        @try { [g.satFilter setValue:@(sat) forKey:@"inputAmount"]; } @catch (NSException *e) {}
+        g.backdrop.filters = g.satFilter ? @[g.blurFilter, g.satFilter] : @[g.blurFilter];
+
+        CGRect tr = [label textRectForBounds:lb limitedToNumberOfLines:1];
+        CGFloat baseline = tr.origin.y + font.ascender;
+        CGPathRef p = newGlyphPath(text, font, label.textAlignment, lb.size.width, baseline);
+        if (p) {
+            g.fillMask.path = p;
+            g.tintShape.path = p;
+            g.edgeShape.path = p;
+            CFLogOnce([NSString stringWithFormat:@"glass/%@/%.0f", NSStringFromClass([label class]), font.pointSize],
+                      @"liquidGlass: installed for %@ in %@, glyph box=%@ baseline=%.1f label=%@ refraction=%d",
+                      NSStringFromClass([label class]), NSStringFromClass([host class]),
+                      NSStringFromCGRect(CGPathGetBoundingBox(p)), baseline, NSStringFromCGRect(lb), (int)(g.metal != nil));
+
+            if (g.metal) {
+                // Distance field of the new outline, off the main thread; the Metal layer starts drawing when it lands.
+                CGPathRef pc = CGPathCreateCopy(p);
+                NSUInteger token = ++g.sdfToken;
+                CGSize sz = lb.size;
+                CGFloat sdfScale = MIN(gPxScale, 2.0);
+                __weak CFGlassView *wg = g;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    CFTimeInterval t0 = CACurrentMediaTime();
+                    id<MTLTexture> t = buildSDF(pc, sz, sdfScale, 48.0f);
+                    CGPathRelease(pc);
+                    double ms = (CACurrentMediaTime() - t0) * 1000.0;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        CFGlassView *s = wg;
+                        if (!s || s.sdfToken != token) return;
+                        CFLogOnce(@"sdf", @"metal: glyph SDF %s in %.1f ms (%.0fx%.0f pt at %.1f px/pt)", t ? "ok" : "FAILED", ms, sz.width, sz.height, sdfScale);
+                        [CATransaction begin];
+                        [CATransaction setDisableActions:YES];
+                        s.sdfTex = t;
+                        s.sdfToPx = (float)(gPxScale / sdfScale);
+                        s.dirty = YES;
+                        if (t) { s.tintShape.hidden = YES; s.edgeGradient.hidden = YES; }
+                        [CATransaction commit];
+                    });
+                });
+            }
+            CGPathRelease(p);
+        }
+        g.tintShape.fillColor = [UIColor colorWithWhite:1.0 alpha:tint].CGColor;
+        g.edgeShape.lineWidth = edgeW;
+        BOOL metalReady = (g.metal != nil && g.sdfTex != nil);
+        g.tintShape.hidden = metalReady;
+        g.edgeGradient.hidden = metalReady || edge <= 0.001 || edgeW <= 0.01;
+        g.edgeGradient.colors = @[
+            (id)[UIColor colorWithWhite:1.0 alpha:edge].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:edge * 0.22].CGColor,
+            (id)[UIColor colorWithWhite:1.0 alpha:edge * 0.60].CGColor,
+        ];
+        g.edgeGradient.locations = @[@0.0, @0.5, @1.0];
+    }
+    [CATransaction commit];
+
+    // Dim the stock vibrant digits so the glass reads as glass, not as a sticker on top of white text.
+    if (!objc_getAssociatedObject(label, &kBaseAlphaKey)) {
+        objc_setAssociatedObject(label, &kBaseAlphaKey, @(label.alpha), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    CGFloat base = cfgNum(@"glassBaseAlpha", 0.30);
+    if (fabs(label.alpha - base) > 0.005) label.alpha = base;
+}
+
+static void scheduleGlass(UILabel *l) {
+    if (!gGlassOn || objc_getAssociatedObject(l, &kGlassPendKey)) return;
+    objc_setAssociatedObject(l, &kGlassPendKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    __weak UILabel *weak = l;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UILabel *s = weak;
+        if (!s) return;
+        objc_setAssociatedObject(s, &kGlassPendKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        updateGlass(s);
+    });
+}
+
+static void updateAllGlass(void) {
+    if (!gGlassOn) return;
+    for (UILabel *l in [gLabels allObjects]) if (l.window) updateGlass(l);
+}
+
+#pragma mark - restyle
+
 static void restyle(UILabel *label, CGFloat curPoint) {
     CGFloat fill = fillSize();
     CGFloat target = fill > 0 ? fill : curPoint * gScale;
@@ -383,6 +1142,7 @@ static void restyle(UILabel *label, CGFloat curPoint) {
         if (i > 0) v.clipsToBounds = NO;
     }
     extendEffects(label);
+    scheduleGlass(label);
 }
 
 static void applyToLabel(UILabel *label) {
@@ -390,7 +1150,11 @@ static void applyToLabel(UILabel *label) {
     UIFont *cur = label.font;
     if (!cur || cur.pointSize < gMinPt) return;
     if (objc_getAssociatedObject(label, &kBusyKey)) return;
-    if (isOurFont(cur)) return;
+    if (isOurFont(cur)) {
+        // Already styled: the text just changed (a new minute), so refresh the glass outline.
+        if (gGlassOn && objc_getAssociatedObject(label, &kClockKey)) scheduleGlass(label);
+        return;
+    }
     if (!isClockString(label.text)) return;
 
     objc_setAssociatedObject(label, &kOrigKey, @(cur.pointSize), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -428,9 +1192,14 @@ static void reloadIfChanged(void) {
 
     CFLog(@"config changed, reloading");
     loadConfig();
+    // Always drop the glass first: it is rebuilt below with the new numbers if still wanted.
+    for (UILabel *l in [gLabels allObjects]) removeGlass(l);
     if (![gConfig[@"enabled"] boolValue]) {
         CFLog(@"enabled=false: new labels are left alone, respring to restore the stock font");
         gActive = NO;
+        gGlassOn = NO;
+        gRefractOn = NO;
+        [CFGlassDriver stop];
         return;
     }
     CTFontDescriptorRef nb = findBaseDescriptor();
@@ -441,6 +1210,12 @@ static void reloadIfChanged(void) {
     [gCache removeAllObjects];
     gFillDone = NO;
     gActive = YES;
+    gGlassOn = [gConfig[@"liquidGlass"] boolValue] && glassSupported();
+    if (gGlassOn && [gConfig[@"glassRefraction"] boolValue] && !gMetalOK) gMetalOK = setupMetal();
+    gRefractOn = gGlassOn && gMetalOK && [gConfig[@"glassRefraction"] boolValue];
+    gNeedCapture = YES;
+    gCapDue = CACurrentMediaTime() + 0.3;
+    [CFGlassDriver stop];
     for (UILabel *l in [gLabels allObjects]) {
         if (l.window == nil && l.superview == nil) continue;
         NSNumber *orig = objc_getAssociatedObject(l, &kOrigKey);
@@ -469,6 +1244,7 @@ static void reloadIfChanged(void) {
     if (isLiveClock(self)) {
         extendEffects(self);
         alignLayers();
+        updateGlass(self);
     }
 }
 - (void)setBounds:(CGRect)bounds {
@@ -478,14 +1254,16 @@ static void reloadIfChanged(void) {
     }
     CGRect g = bounds;
     CGSize need = neededSize(self);
-    CGFloat dh = 0;
-    if (g.size.width < need.width) g.size.width = need.width;
+    CGFloat dw = 0, dh = 0;
+    if (g.size.width < need.width) { dw = need.width - g.size.width; g.size.width = need.width; }
     if (g.size.height < need.height) { dh = need.height - g.size.height; g.size.height = need.height; }
+    BOOL hadWidth = bounds.size.width > 1.0;
     %orig(g);
-    if (dh > 0) {
-        // bounds grow around the center; shift the center so the top edge stays put.
+    // Bounds grow around the center. Keep the top edge, and for a zero-width label also the left edge.
+    CGFloat sx = (dw > 0 && !hadWidth) ? dw / 2.0 : 0;
+    if (sx != 0 || dh > 0) {
         CGPoint c = self.center;
-        self.center = CGPointMake(c.x, c.y + dh / 2.0);
+        self.center = CGPointMake(c.x + sx, c.y + dh / 2.0);
     }
 }
 %end
@@ -509,6 +1287,19 @@ static void reloadIfChanged(void) {
         UIFont *test = clockFont(80.0);
         CFLog(@"loaded in %@, test font at 80 pt: %@", bid, test ? test.fontName : @"FAILED");
         if (!test) return;
+        BOOL canGlass = glassSupported();
+        gGlassOn = [gConfig[@"liquidGlass"] boolValue] && canGlass;
+        if (gGlassOn && [gConfig[@"glassRefraction"] boolValue]) gMetalOK = setupMetal();
+        gRefractOn = gGlassOn && gMetalOK && [gConfig[@"glassRefraction"] boolValue];
+        CFLog(@"liquidGlass: wanted=%@ supported=%d active=%d refraction=%d", gConfig[@"liquidGlass"], (int)canGlass, (int)gGlassOn, (int)gRefractOn);
+        @try {
+            Class FL = NSClassFromString(@"CAFilter");
+            SEL ft = NSSelectorFromString(@"filterTypes");
+            if (FL && [FL respondsToSelector:ft]) CFLog(@"CAFilter types: %@", ((id (*)(id, SEL))objc_msgSend)(FL, ft));
+        } @catch (NSException *e) {}
+        CFNotificationCenterRef dn = CFNotificationCenterGetDarwinNotifyCenter();
+        CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.example.clockfont.recapture"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(dn, NULL, onRecapture, CFSTR("com.apple.springboard.lockstate"), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         gActive = YES;
         %init;
 
@@ -517,6 +1308,7 @@ static void reloadIfChanged(void) {
         dispatch_source_set_event_handler(timer, ^{
             reloadIfChanged();
             alignLayers();
+            updateAllGlass();
         });
         dispatch_resume(timer);
         objc_setAssociatedObject([NSBundle mainBundle], "ClockFontTimer", timer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
